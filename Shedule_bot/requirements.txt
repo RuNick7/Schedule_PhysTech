@@ -1,0 +1,24 @@
+# --- Core ---
+aiogram>=3.3,<4
+magic-filter>=1.0,<2           # фильтры F.*
+aiohttp>=3.9,<4                # транспорт для aiogram
+
+fastapi>=0.110,<1
+uvicorn[standard]>=0.30,<1     # uvloop, httptools, websockets и т.п.
+
+requests>=2.31,<3
+
+# --- Config ---
+pydantic>=2.6,<3
+pydantic-settings>=2.2,<3
+python-dotenv>=1.0,<2
+
+# --- Google Sheets ---
+gspread>=6,<7
+google-auth>=2.27,<3           # для service_account в gspread
+
+# --- (Опционально, но полезно для OAuth) ---
+google-auth-oauthlib>=1.2,<2   # если решишь не руками обменивать код на токены
+
+# --- (Опционально для фоновой авто-синхры) ---
+APScheduler>=3.10,<4
