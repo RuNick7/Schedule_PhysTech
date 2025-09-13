@@ -169,6 +169,7 @@ async def gcal_sync_today(q: CallbackQuery):
             log.exception("GCAL sync failed for lesson=%s time=%s day=%s", lesson.get("subject") or lesson.get("text"),
                           lesson.get("time"), lesson.get("day"))
 
+    log.info("sync_today done user=%s ok=%d fail=%d", q.from_user.id, ok, fail)
     # отметка о синхронизации
     try:
         from datetime import datetime, timezone

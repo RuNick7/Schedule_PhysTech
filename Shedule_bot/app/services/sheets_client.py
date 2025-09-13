@@ -9,6 +9,9 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 from app.config import settings
+import logging
+
+log = logging.getLogger("gcal.api")
 
 FIELDS = (
     "sheets("
