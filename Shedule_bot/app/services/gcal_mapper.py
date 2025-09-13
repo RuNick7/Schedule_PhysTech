@@ -2,17 +2,25 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Tuple, Optional
-from app.config import settings
-from app.services.gcal_client import build_event_min
+from Shedule_bot.app.config import settings
+from Shedule_bot.app.services.gcal_client import build_event_min
+import re
+
+_TIME_RE = re.compile(
+    r"^\s*(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*$"
+)
 
 def _parse_time_range(time_str: str) -> Tuple[str, str]:
     """
-    'HH:MM-YY:ZZ' или 'HH:MM–YY:ZZ' → ('HH:MM:00', 'YY:ZZ:00')
+    Поддерживает '-', '–', '—', пробелы вокруг,
+    и разделитель часов ':' или '.'
     """
-    s = time_str.replace("–", "-").strip()
-    a, b = [t.strip() for t in s.split("-", 1)]
-    if len(a) == 5: a = a + ":00"
-    if len(b) == 5: b = b + ":00"
+    m = _TIME_RE.match(time_str or "")
+    if not m:
+        raise ValueError(f"Bad time range: {time_str!r}")
+    h1, m1, h2, m2 = map(int, m.groups())
+    a = f"{h1:02d}:{m1:02d}:00"
+    b = f"{h2:02d}:{m2:02d}:00"
     return a, b
 
 def _rfc_date(dt: datetime) -> str:

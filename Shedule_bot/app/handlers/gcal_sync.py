@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import os
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton
 from aiogram import Router, F
 from datetime import timedelta
 from aiogram.types import CallbackQuery
-from app.services.gcal_client import upsert_event
-from app.handlers.schedule_view import _load_lessons_for_user_group
-from app.services.gcal_mapper import lesson_to_event
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from app.utils.dt import now_tz
-from app.services.db import set_gcal_last_sync
-from app.utils.week_parity import week_parity_for_date
+from Shedule_bot.app.services.gcal_client import upsert_event
+from Shedule_bot.app.handlers.schedule_view import _load_lessons_for_user_group
+from Shedule_bot.app.services.gcal_mapper import lesson_to_event
+from Shedule_bot.app.utils.dt import now_tz
+from Shedule_bot.app.services.db import set_gcal_last_sync
+from Shedule_bot.app.utils.week_parity import week_parity_for_date
 
-from app.services.db import (
+from Shedule_bot.app.services.db import (
     get_user,
     # ожидаем, что есть эти функции (добавь в db.py при необходимости):
     # set_gcal_connected(telegram_id: int, connected: bool) -> None
@@ -20,7 +21,10 @@ from app.services.db import (
     # set_gcal_calendar_id(telegram_id: int, cal_id: str) -> None
     # set_gcal_last_sync(telegram_id: int, iso: str) -> None
 )
-from app.config import settings
+from Shedule_bot.app.config import settings
+
+import logging
+log = logging.getLogger("gcal")
 
 router = Router()
 
@@ -157,13 +161,13 @@ async def gcal_sync_today(q: CallbackQuery):
     ok, fail = 0, 0
     for lesson in day_lessons:
         try:
-            event, key = lesson_to_event(u, lesson, now)
-            await q.bot.loop.run_in_executor(
-                None, lambda: upsert_event(q.from_user.id, cal_id, event, key)
-            )
+            event, key = lesson_to_event(u, lesson, now)  # или dt_day
+            await q.bot.loop.run_in_executor(None, lambda: upsert_event(q.from_user.id, cal_id, event, key))
             ok += 1
         except Exception as e:
             fail += 1
+            log.exception("GCAL sync failed for lesson=%s time=%s day=%s", lesson.get("subject") or lesson.get("text"),
+                          lesson.get("time"), lesson.get("day"))
 
     # отметка о синхронизации
     try:
@@ -186,7 +190,7 @@ async def gcal_sync_week(q: CallbackQuery):
 
     tz = u.get("timezone") or settings.timezone
     # auto/чёт/нечёт мы уже обрабатываем в UI; здесь возьмём auto
-    from app.utils.week_parity import week_parity_for_date
+    from Shedule_bot.app.utils.week_parity import week_parity_for_date
     parity = week_parity_for_date(None, tz)
 
     lessons = await _load_lessons_for_user_group(u)
