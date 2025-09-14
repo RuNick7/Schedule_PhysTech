@@ -14,6 +14,7 @@ from app.services.db import get_user, set_gcal_tokens
 
 GCAL_API = "https://www.googleapis.com/calendar/v3"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 
 class GCalError(RuntimeError):
@@ -28,6 +29,38 @@ class TokenBundle:
 
 
 # ======== ВНУТРЕННЕЕ: работа с токенами ========
+def revoke_tokens(telegram_id: int) -> bool:
+    """
+    Пытается отозвать refresh/access токены в Google.
+    Возвращает True, если запрос(ы) к revoke прошли без фатальной ошибки.
+    """
+    import requests
+    import logging
+    log = logging.getLogger("gcal.api")
+
+    u = get_user(telegram_id)
+    if not u:
+        return True  # ничего отзывать
+
+    ok = True
+    for tok in (u.get("gcal_refresh_token"), u.get("gcal_access_token")):
+        if not tok:
+            continue
+        try:
+            # 200 — успех, 400 — уже отозван/несуществующий токен (тоже ок)
+            r = requests.post(
+                GOOGLE_REVOKE_URL,
+                data={"token": tok},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10,
+            )
+            if r.status_code not in (200, 400):
+                log.warning("revoke token unexpected status=%s body=%s", r.status_code, r.text)
+        except Exception as e:
+            ok = False
+            log.exception("revoke token failed: %s", e)
+
+    return ok
 
 def _parse_iso_utc(s: str) -> float:
     """

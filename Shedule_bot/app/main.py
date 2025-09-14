@@ -5,6 +5,7 @@ from app.utils.logging import setup_logging
 from app.services.db import init_db
 from app.handlers import start, menu  # noqa: F401
 from app.autosend.runner import start_autosend
+from app.services.db import migrate_gcal_autosync
 import os, logging, sys
 
 # >>> логирование — в самом верху файла!
@@ -24,6 +25,7 @@ print(">>> BOT STARTED", flush=True)
 async def main():
     setup_logging()
     init_db()
+    migrate_gcal_autosync()
     start_autosend(bot)
     await dp.start_polling(bot)
 

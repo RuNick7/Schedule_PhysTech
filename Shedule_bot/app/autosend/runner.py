@@ -23,6 +23,8 @@ from app.utils.week_parity import week_parity_for_date
 from app.utils.dt import now_tz
 from app.utils.format_schedule import format_day
 from app.config import settings
+from app.cron.gcal_autosync import gcal_autosync_tick
+
 
 log = logging.getLogger("autosend")
 
@@ -131,6 +133,7 @@ async def _tick(bot: Bot):
             await _morning_send_mode1(bot, hhmm, ymd)
             await _morning_send_mode2(bot, hhmm, ymd)
             await _live_update_mode2(bot, ymd)
+            await gcal_autosync_tick(bot)
 
             await asyncio.sleep(30)
         except asyncio.CancelledError:

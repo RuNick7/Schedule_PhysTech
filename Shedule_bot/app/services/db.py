@@ -206,6 +206,21 @@ def list_users_mode2_enabled() -> List[Dict[str, Any]]:
         )
         return [dict(r) for r in cur.fetchall()]
 
+def migrate_gcal_autosync():
+    with _get_conn() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        def add(col_name: str, ddl: str):
+            if col_name not in cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
+
+        add("gcal_autosync_enabled",  "gcal_autosync_enabled INTEGER NOT NULL DEFAULT 0")
+        add("gcal_autosync_mode",     "gcal_autosync_mode TEXT DEFAULT 'daily'")  # 'daily' | 'weekly'
+        add("gcal_autosync_time",     "gcal_autosync_time TEXT")                  # 'HH:MM'
+        add("gcal_autosync_weekday",  "gcal_autosync_weekday INTEGER")            # 0..6 (Mon..Sun)
+        add("gcal_autosync_last_key", "gcal_autosync_last_key TEXT")              # 'daily:YYYY-MM-DD' / 'weekly:YYYY-Www'
+        conn.commit()
+
+
 def get_autosend_last_date(telegram_id: int) -> Optional[str]:
     with _get_conn() as conn:
         cur = conn.execute("SELECT autosend_last_date FROM users WHERE telegram_id = ?", (telegram_id,))
@@ -300,3 +315,57 @@ def set_gcal_last_sync(telegram_id: int, iso: Optional[str] = None):
     with _get_conn() as conn:
         conn.execute("UPDATE users SET gcal_last_sync = ? WHERE telegram_id = ?", (iso, telegram_id))
         conn.commit()
+
+def set_gcal_autosync_enabled(telegram_id: int, enabled: bool):
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute("UPDATE users SET gcal_autosync_enabled = ? WHERE telegram_id = ?",
+                     (1 if enabled else 0, telegram_id))
+        conn.commit()
+
+def set_gcal_autosync_mode(telegram_id: int, mode: str):
+    mode = (mode or "daily").lower()
+    if mode not in ("daily", "weekly"):
+        raise ValueError("gcal_autosync_mode must be 'daily' or 'weekly'")
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute("UPDATE users SET gcal_autosync_mode = ? WHERE telegram_id = ?", (mode, telegram_id))
+        conn.commit()
+
+def set_gcal_autosync_time(telegram_id: int, hhmm: str):
+    if not _TIME_RE.match(hhmm or ""):
+        raise ValueError("gcal_autosync_time must be 'HH:MM' 24h")
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute("UPDATE users SET gcal_autosync_time = ? WHERE telegram_id = ?", (hhmm, telegram_id))
+        conn.commit()
+
+def set_gcal_autosync_weekday(telegram_id: int, weekday: int):
+    if weekday not in range(0, 7):
+        raise ValueError("gcal_autosync_weekday must be 0..6 (Mon..Sun)")
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute("UPDATE users SET gcal_autosync_weekday = ? WHERE telegram_id = ?", (weekday, telegram_id))
+        conn.commit()
+
+def set_gcal_autosync_last_key(telegram_id: int, key: str):
+    with _get_conn() as conn:
+        conn.execute("UPDATE users SET gcal_autosync_last_key = ? WHERE telegram_id = ?", (key, telegram_id))
+        conn.commit()
+
+def get_gcal_autosync(user_id: int) -> Dict[str, Any]:
+    with _get_conn() as conn:
+        r = conn.execute(
+            "SELECT gcal_autosync_enabled, gcal_autosync_mode, gcal_autosync_time, "
+            "gcal_autosync_weekday, gcal_autosync_last_key FROM users WHERE telegram_id = ?",
+            (user_id,)
+        ).fetchone()
+        return dict(r) if r else {}
+
+def list_users_gcal_autosync_enabled() -> list[Dict[str, Any]]:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM users WHERE gcal_autosync_enabled = 1 AND gcal_connected = 1 "
+            "AND (gcal_autosync_time IS NOT NULL AND gcal_autosync_time <> '')"
+        )
+        return [dict(x) for x in cur.fetchall()]
