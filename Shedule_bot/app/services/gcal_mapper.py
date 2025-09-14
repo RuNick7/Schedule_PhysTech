@@ -2,8 +2,8 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Tuple, Optional
-from Shedule_bot.app.config import settings
-from Shedule_bot.app.services.gcal_client import build_event_min
+from app.config import settings
+from app.services.gcal_client import build_event_min
 import re
 import logging
 
