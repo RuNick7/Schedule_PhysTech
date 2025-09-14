@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import os
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from app.services.gcal_client import list_calendars, create_calendar
+from app.services.db import get_user, set_gcal_calendar_id
 from contextlib import suppress
+from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
 from aiogram import Router, F
@@ -32,7 +39,64 @@ log = logging.getLogger("gcal")
 
 router = Router()
 
+class AutoSyncTime(StatesGroup):
+    waiting_time = State()
+
 # ---------- helpers ----------
+
+async def _sync_next_days_for_user(user_id: int, days: int = 7) -> tuple[int, int]:
+    u = get_user(user_id)
+    if not u or not u.get("gcal_connected"):
+        return (0, 0)
+
+    tz = u.get("timezone") or settings.timezone
+    base = now_tz(tz)
+    lessons = await _load_lessons_for_user_group(u)
+    cal_id = u.get("gcal_calendar_id") or "primary"
+
+    ok = fail = 0
+    day_to_off = {  # для названия дня из данных
+        "ПОНЕДЕЛЬНИК": 0, "ВТОРНИК": 1, "СРЕДА": 2, "ЧЕТВЕРГ": 3, "ПЯТНИЦА": 4, "СУББОТА": 5, "ВОСКРЕСЕНЬЕ": 6
+    }
+
+    for i in range(days):
+        dt_day = base + timedelta(days=i)
+        day_upper = _weekday_upper(dt_day)
+        parity = week_parity_for_date(dt_day, tz)  # чётность конкретного дня!
+
+        day_lessons = [
+            it for it in lessons
+            if str(it.get("parity","")).strip().lower() == str(parity).strip().lower()
+            and str(it.get("day","")).strip().upper() == day_upper
+        ]
+
+        for lesson in day_lessons:
+            try:
+                event, key = lesson_to_event(u, lesson, dt_day)
+                await asyncio.to_thread(upsert_event, user_id, cal_id, event, key)
+                ok += 1
+            except Exception:
+                fail += 1
+                log.exception("sync_next_days failed user=%s day=%s lesson=%r", user_id, dt_day.date(), lesson)
+
+    try:
+        from datetime import datetime, timezone
+        set_gcal_last_sync(user_id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        pass
+
+    return ok, fail
+
+HUSH_UNKNOWN_SUBJECTS = {"история"}  # тут можно расширять: {"история", "английский язык"}
+def _is_unknown_time(lesson: dict) -> bool:
+    text = (lesson.get("subject") or lesson.get("text") or "").lower()
+    # твой парсер уже ставит special=True для «см. прилож.» — используем это
+    return bool(lesson.get("special")) or "⚠" in text or "см. прилож" in text
+
+def _is_hushed_unknown(lesson: dict) -> bool:
+    text = (lesson.get("subject") or lesson.get("text") or "").lower()
+    return _is_unknown_time(lesson) and any(s in text for s in HUSH_UNKNOWN_SUBJECTS)
+
 def _weekday_upper(dt) -> str:
     return ["ПОНЕДЕЛЬНИК","ВТОРНИК","СРЕДА","ЧЕТВЕРГ","ПЯТНИЦА","СУББОТА","ВОСКРЕСЕНЬЕ"][dt.weekday()]
 
@@ -76,6 +140,32 @@ def _kb_choose_calendar(current: str | None):
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
+def _kb_choose_calendar_dynamic(current_id: str | None, cals: list[dict]):
+    """
+    Кнопки вида:
+      • <summary> (primary)
+      <summary>
+      ➕ Создать календарь
+      🔄 Обновить   ⬅️ Назад
+    Выбор делаем по индексу, чтобы не класть длинный calendarId в callback_data.
+    """
+    kb = InlineKeyboardBuilder()
+    cur = (current_id or "primary")
+
+    for idx, it in enumerate(cals):
+        mark = "• " if it["id"] == cur else ""
+        suffix = " (primary)" if it.get("primary") else ""
+        title = (it.get("summary") or it["id"]) + suffix
+        kb.button(text=f"{mark}{title}", callback_data=f"gcal:cal:sel:{idx}")
+
+    kb.button(text="➕ Создать отдельный календарь", callback_data="gcal:cal:create")
+    kb.button(text="🔄 Обновить", callback_data="gcal:cal:refresh")
+    kb.button(text="⬅️ Назад", callback_data="gcal:open")
+    # раскладка: по одному в строке для читабельности
+    kb.adjust(*([1] * (len(cals) + 2)), 1)
+    return kb.as_markup()
+
+
 def _kb_disconnect_confirm():
     kb = InlineKeyboardBuilder()
     kb.button(text="🔌 Только отвязать", callback_data="gcal:disconnect:confirm:keep")
@@ -84,10 +174,39 @@ def _kb_disconnect_confirm():
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
+def _fmt_last_sync_human(u: dict) -> str:
+    """
+    Превращает ISO в 'сегодня/вчера в HH:MM (TZ)' или 'DD.MM.YYYY в HH:MM (TZ)'.
+    Ожидает u['gcal_last_sync'] вида 'YYYY-MM-DDTHH:MM:SSZ'.
+    """
+    s = u.get("gcal_last_sync")
+    if not s:
+        return "—"
+    try:
+        dt_utc = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return s  # на всякий случай покажем как есть
+
+    tzname = u.get("timezone") or settings.timezone
+    try:
+        local = dt_utc.astimezone(ZoneInfo(tzname))
+    except Exception:
+        local = dt_utc  # fallback: UTC
+
+    now_local = now_tz(tzname)
+    if local.date() == now_local.date():
+        day_part = "сегодня"
+    elif (now_local.date() - local.date()).days == 1:
+        day_part = "вчера"
+    else:
+        day_part = local.strftime("%d.%m.%Y")
+
+    return f"{day_part} в {local.strftime('%H:%M')} ({tzname})"
+
 def _status_text(u: dict) -> str:
     connected = bool(u.get("gcal_connected"))
     cal = u.get("gcal_calendar_id") or "primary"
-    last = u.get("gcal_last_sync") or "—"
+    last = _fmt_last_sync_human(u)
     lines = [
         "📆 <b>Google Calendar</b>",
         f"Статус: {'✅ Подключен' if connected else '⛔️ Не подключен'}",
@@ -125,16 +244,108 @@ async def gcal_open(q: CallbackQuery):
 # ---------- choose calendar ----------
 
 @router.callback_query(F.data == "gcal:choose_cal")
-async def gcal_choose_calendar(q: CallbackQuery):
+async def gcal_choose_calendar(q: CallbackQuery, state: FSMContext):
+    with suppress(TelegramBadRequest):
+        await q.answer()
+
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
-        await q.answer("Сначала подключите Google Calendar.", show_alert=True); return
-    await q.message.edit_text(
-        "Выберите календарь для синхронизации:",
-        reply_markup=_kb_choose_calendar(u.get("gcal_calendar_id")),
-        disable_web_page_preview=True,
-    )
-    await q.answer()
+        await (q.message.answer if q.message else q.bot.send_message)(
+            q.from_user.id, "Сначала подключите Google Calendar."
+        )
+        return
+
+    # грузим список календарей в отдельном потоке
+    try:
+        cals = await asyncio.to_thread(list_calendars, q.from_user.id)
+    except Exception:
+        log.exception("list_calendars failed user=%s", q.from_user.id)
+        await (q.message.answer if q.message else q.bot.send_message)(
+            q.from_user.id, "Не удалось получить список календарей. Попробуйте позже."
+        )
+        return
+
+    # сохраняем мапу idx->calendarId в FSM (на одного пользователя)
+    await state.update_data(gcal_calmap={str(i): it["id"] for i, it in enumerate(cals)})
+
+    text = "Выберите календарь для синхронизации:"
+    markup = _kb_choose_calendar_dynamic(u.get("gcal_calendar_id"), cals)
+    if q.message:
+        await q.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    else:
+        await q.bot.send_message(q.from_user.id, text, reply_markup=markup)
+
+@router.callback_query(F.data == "gcal:cal:refresh")
+async def gcal_cal_refresh(q: CallbackQuery, state: FSMContext):
+    with suppress(TelegramBadRequest):
+        await q.answer("Обновляю…")
+
+    u = get_user(q.from_user.id) or {}
+    try:
+        cals = await asyncio.to_thread(list_calendars, q.from_user.id)
+    except Exception:
+        log.exception("list_calendars failed user=%s", q.from_user.id)
+        await (q.message.answer if q.message else q.bot.send_message)(
+            q.from_user.id, "Не удалось обновить список календарей."
+        )
+        return
+
+    await state.update_data(gcal_calmap={str(i): it["id"] for i, it in enumerate(cals)})
+
+    markup = _kb_choose_calendar_dynamic(u.get("gcal_calendar_id"), cals)
+    if q.message:
+        await q.message.edit_text("Выберите календарь для синхронизации:", reply_markup=markup)
+    else:
+        await q.bot.send_message(q.from_user.id, "Выберите календарь для синхронизации:", reply_markup=markup)
+
+@router.callback_query(F.data.startswith("gcal:cal:sel:"))
+async def gcal_cal_select(q: CallbackQuery, state: FSMContext):
+    with suppress(TelegramBadRequest):
+        await q.answer("Сохраняю…")
+
+    idx = q.data.split(":")[-1]
+    data = await state.get_data()
+    calmap: dict = data.get("gcal_calmap") or {}
+    cal_id = calmap.get(idx)
+
+    if not cal_id:
+        # мапа устарела — откроем список заново
+        return await gcal_choose_calendar(q, state)
+
+    try:
+        set_gcal_calendar_id(q.from_user.id, cal_id)
+    except Exception:
+        log.exception("set_gcal_calendar_id failed user=%s id=%s", q.from_user.id, cal_id)
+
+    # вернуться на главный экран GCAL
+    from app.handlers.gcal_sync import gcal_open  # если функция в этом же файле — просто вызываем
+    await gcal_open(q)
+
+@router.callback_query(F.data == "gcal:cal:create")
+async def gcal_create_separate(q: CallbackQuery):
+    with suppress(TelegramBadRequest):
+        await q.answer("Создаю календарь…")
+
+    u = get_user(q.from_user.id) or {}
+    title = f"Расписание ({u.get('group_code') or 'бот'})"
+    tz = u.get("timezone") or settings.timezone
+
+    try:
+        new_id = await asyncio.to_thread(create_calendar, q.from_user.id, title, tz)
+        set_gcal_calendar_id(q.from_user.id, new_id)
+        msg = f"✅ Календарь «{title}» создан и выбран."
+    except Exception:
+        log.exception("create_calendar failed user=%s", q.from_user.id)
+        msg = "⛔ Не удалось создать календарь. Попробуйте позже."
+
+    # показываем статус GCAL
+    try:
+        await (q.message.answer if q.message else q.bot.send_message)(q.from_user.id, msg)
+    except Exception:
+        pass
+
+    from app.handlers.gcal_sync import gcal_open
+    await gcal_open(q)
 
 @router.callback_query(F.data == "gcal:cal:primary")
 async def gcal_set_primary(q: CallbackQuery):
@@ -311,9 +522,16 @@ async def _sync_today_for_user(user_id: int) -> tuple[int,int]:
     parity = week_parity_for_date(now, tz)
     day_upper = _weekday_upper(now)
     lessons = await _load_lessons_for_user_group(u)
+    unknown_hushed = [it for it in lessons if _is_hushed_unknown(it)]
     today = [it for it in lessons
              if str(it.get("parity","")).strip().lower() == str(parity).strip().lower()
              and str(it.get("day","")).strip().upper() == day_upper]
+    if unknown_hushed:
+        subj_names = sorted(
+            {(it.get("subject") or it.get("text") or "Предмет").split(" —")[0] for it in unknown_hushed})
+        note = "⚠️ Сегодня есть " + ", ".join(subj_names) + ", но время не указано. Я не добавлял событие в календарь."
+        # показываем пользователю один раз
+        await q.message.answer(note)
     cal_id = u.get("gcal_calendar_id") or "primary"
     ok = fail = 0
     for lesson in today:
@@ -331,35 +549,55 @@ async def _sync_today_for_user(user_id: int) -> tuple[int,int]:
         pass
     return ok, fail
 
-async def _sync_week_for_user(user_id: int) -> tuple[int,int]:
+async def _sync_week_for_user(user_id: int, weeks_ahead: int = 0) -> tuple[int,int]:
+    """
+    Синхронизирует одну неделю пользователя.
+    weeks_ahead=0 — текущая неделя, =1 — следующая и т.д.
+    """
     u = get_user(user_id)
     if not u or not u.get("gcal_connected"):
         return (0, 0)
     tz = u.get("timezone") or settings.timezone
-    parity = week_parity_for_date(None, tz)
-    lessons = await _load_lessons_for_user_group(u)
-    week_lessons = [it for it in lessons if str(it.get("parity","")).strip().lower() == str(parity).strip().lower()]
+
     base = now_tz(tz)
-    monday = base - timedelta(days=base.weekday())
-    day_to_off = {"ПОНЕДЕЛЬНИК":0,"ВТОРНИК":1,"СРЕДА":2,"ЧЕТВЕРГ":3,"ПЯТНИЦА":4,"СУББОТА":5,"ВОСКРЕСЕНЬЕ":6}
+    monday = base - timedelta(days=base.weekday()) + timedelta(days=7*weeks_ahead)
+
+    # чётность берём именно от понедельника той недели
+    parity = week_parity_for_date(monday, tz)
+
+    lessons = await _load_lessons_for_user_group(u)
+
+    def norm(x): return str(x or "").strip().lower()
+    week_lessons = [it for it in lessons if norm(it.get("parity")) == norm(parity)]
+
+    # (опционально) фильтрация «неизвестных по времени» предметов (например, ИСТОРИЯ «см. прилож.»)
+    try:
+        if '_is_hushed_unknown' in globals():
+            week_lessons = [it for it in week_lessons if not _is_hushed_unknown(it)]
+    except Exception:
+        pass
+
     cal_id = u.get("gcal_calendar_id") or "primary"
+    day_to_off = {"ПОНЕДЕЛЬНИК":0,"ВТОРНИК":1,"СРЕДА":2,"ЧЕТВЕРГ":3,"ПЯТНИЦА":4,"СУББОТА":5,"ВОСКРЕСЕНЬЕ":6}
+
     ok = fail = 0
     for lesson in week_lessons:
         try:
-            day_raw = str(lesson.get("day","")).strip().upper()
-            off = day_to_off[day_raw]
+            off = day_to_off[str(lesson["day"]).strip().upper()]
             dt_day = monday + timedelta(days=off)
             event, key = lesson_to_event(u, lesson, dt_day)
             await asyncio.to_thread(upsert_event, user_id, cal_id, event, key)
             ok += 1
         except Exception:
             fail += 1
-            log.exception("sync_week core failed user=%s lesson=%r", user_id, lesson)
+            log.exception("sync_week core failed user=%s weeks_ahead=%s lesson=%r", user_id, weeks_ahead, lesson)
+
     try:
         from datetime import datetime, timezone
         set_gcal_last_sync(user_id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     except Exception:
         pass
+
     return ok, fail
 
 # ---------- disconnect ----------
@@ -433,22 +671,29 @@ async def gcal_disconnect_confirm(q: CallbackQuery):
 def _wd_name(i: int) -> str:
     return ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"][i]
 
-def _kb_auto_settings(u: dict):
-    a = get_gcal_autosync(u["telegram_id"])  # из db.py
-    enabled = bool(a.get("gcal_autosync_enabled"))
-    mode = (a.get("gcal_autosync_mode") or "daily")
-    time = a.get("gcal_autosync_time") or "08:00"
-    wday = a.get("gcal_autosync_weekday")
-    wday = int(wday) if wday is not None else 0
+def _mode_label(mode: str) -> str:
+    return {
+        "daily": "Ежедневно",
+        "weekly": "Еженедельно",
+        "weekly2": "Еженедельно (2 недели)",
+    }[mode]
 
+def _kb_auto_settings(u: dict):
+    a = get_gcal_autosync(u["telegram_id"])
+    mode = (a.get("gcal_autosync_mode") or "daily")
     kb = InlineKeyboardBuilder()
-    kb.button(text=("🟢 Вкл" if enabled else "⚪️ Выкл"), callback_data="gcal:auto:toggle")
-    kb.button(text=f"Режим: {'Ежедневно' if mode=='daily' else 'Еженедельно'}", callback_data="gcal:auto:mode")
-    kb.button(text=f"Время: {time}", callback_data="gcal:auto:time")
-    if mode == "weekly":
-        kb.button(text=f"День: {_wd_name(wday)}", callback_data="gcal:auto:weekday")
+    kb.button(text=("🟢 Вкл" if a.get("gcal_autosync_enabled") else "⚪️ Выкл"), callback_data="gcal:auto:toggle")
+    kb.button(text=f"Режим: {_mode_label(mode)}", callback_data="gcal:auto:mode")
+    kb.button(text=f"Время: {a.get('gcal_autosync_time') or '08:00'}", callback_data="gcal:auto:time")
+    if mode in ("weekly", "weekly2"):  # день недели нужен для обоих weekly-режимов
+        wday = int(a.get("gcal_autosync_weekday") if a.get("gcal_autosync_weekday") is not None else 0)
+        kb.button(text=f"День: {['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][wday]}", callback_data="gcal:auto:weekday")
     kb.button(text="⬅️ Назад", callback_data="gcal:open")
-    kb.adjust(1,1,1,1 if mode=='weekly' else 0,1)
+    rows = [1,1,1]
+    if mode in ("weekly", "weekly2"):
+        rows.append(1)
+    rows.append(1)
+    kb.adjust(*rows)
     return kb.as_markup()
 
 @router.callback_query(F.data == "gcal:auto:open")
@@ -477,25 +722,67 @@ async def gcal_auto_toggle(q: CallbackQuery):
 async def gcal_auto_mode(q: CallbackQuery):
     a = get_gcal_autosync(q.from_user.id)
     mode = (a.get("gcal_autosync_mode") or "daily")
-    new = "weekly" if mode == "daily" else "daily"
+    order = ["daily", "weekly", "weekly2", "rolling7"]  # <-- добавили weekly2
+    new = order[(order.index(mode) + 1) % len(order)]
     set_gcal_autosync_mode(q.from_user.id, new)
-    # дефолт: при weekly ставим Пн=0, если дня нет
-    if new == "weekly" and a.get("gcal_autosync_weekday") is None:
-        set_gcal_autosync_weekday(q.from_user.id, 0)
+    if new in ("weekly", "weekly2") and a.get("gcal_autosync_weekday") is None:
+        set_gcal_autosync_weekday(q.from_user.id, 0)  # Пн по умолчанию
     await gcal_auto_open(q)
 
 # Простая сетка популярных времён
 def _kb_auto_time():
     kb = InlineKeyboardBuilder()
-    for t in ("07:30","08:00","08:30","09:00","18:00","20:00","21:00"):
-        kb.button(text=t, callback_data=f"gcal:auto:time:{t}")
+    # быстрые варианты:
+    for t in ("06:00","07:00","08:00","21:00"):
+        kb.button(text=t, callback_data=f"gcal:auto:time:set:{t}")
+    kb.button(text="✏️ Ввести своё время", callback_data="gcal:auto:time:custom")
     kb.button(text="⬅️ Назад", callback_data="gcal:auto:open")
-    kb.adjust(3,3,1)
+    kb.adjust(3,3,3,1,1)
     return kb.as_markup()
+
+@router.callback_query(F.data == "gcal:auto:time:custom")
+async def gcal_auto_time_custom(q: CallbackQuery, state: FSMContext):
+    with suppress(TelegramBadRequest):
+        await q.answer()
+    await state.set_state(AutoSyncTime.waiting_time)
+    await q.message.answer("Пришлите время в формате <b>HH:MM</b> (24-часовой формат). Например: 07:30")
+
+@router.message(AutoSyncTime.waiting_time)
+async def gcal_auto_time_custom_set(m: Message, state: FSMContext):
+    text = (m.text or "").strip()
+    try:
+        # тут же сработает проверка формата 'HH:MM'
+        set_gcal_autosync_time(m.from_user.id, text)
+    except Exception as e:
+        await m.answer(f"⛔ {e}\nПопробуйте ещё раз, пример: <code>08:00</code>")
+        return
+    await state.clear()
+    await m.answer("✅ Время автосинхронизации сохранено.")
+    # вернём пользователя в экран настроек
+    # (если хочешь — можно отредактировать предыдущее сообщение, но проще отправить новое)
+
+
+@router.callback_query(F.data.startswith("gcal:auto:time:set:"))
+async def gcal_auto_time_set(q: CallbackQuery):
+    with suppress(TelegramBadRequest):
+        await q.answer("Время обновлено")
+    prefix = "gcal:auto:time:set:"
+    hhmm = q.data[len(prefix):]  # например '07:30'
+    try:
+        set_gcal_autosync_time(q.from_user.id, hhmm)
+    except Exception as e:
+        await q.answer(str(e), show_alert=True)
+        return
+    await gcal_auto_open(q)
 
 @router.callback_query(F.data == "gcal:auto:time")
 async def gcal_auto_time_open(q: CallbackQuery):
-    await q.message.edit_text("Выберите время автосинхронизации:", reply_markup=_kb_auto_time())
+    with suppress(TelegramBadRequest):
+        await q.answer()
+    await q.message.edit_text(
+        "Выберите время автосинхронизации или введите своё в формате <b>HH:MM</b> (24ч).",
+        reply_markup=_kb_auto_time(),
+    )
 
 @router.callback_query(F.data.startswith("gcal:auto:time:"))
 async def gcal_auto_time_set(q: CallbackQuery):

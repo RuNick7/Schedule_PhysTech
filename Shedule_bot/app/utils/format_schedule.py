@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import List, Dict, Tuple
 import re
+import random
+import os
 try:
     # если есть «умный» парсер
     from app.utils.teacher_parser import extract_teachers_smart as _extract_teachers
@@ -13,12 +15,39 @@ except Exception:
 
 DAY_ORDER = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ"]
 
+_NO_LESSONS_DEFAULT = [
+    "— Пар не найдено —",
+    "Свободный день! ✨",
+    "Сегодня без пар — можно выдохнуть 🙂",
+    "Ничего в расписании. Береги силы 💪",
+    "Пары отсутствуют. Хорошего дня! 🌿",
+]
+
 LONG_SEP = "-" * 50
 WEEK_SEP = "-" * 50
 
 _TIME_RE = re.compile(r"\s*(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})\s*")
 
 # ===== helpers =====
+def _format_empty_day(group_code: str, day_upper: str, parity: str) -> str:
+    parity_label = "Чётная неделя" if str(parity).lower().startswith("ч") else "Нечётная неделя"
+    header = f"📅 Группа {group_code} • {parity_label} • {day_upper}"
+    sep = "—" * 50
+    return f"{header}\n{sep}\n{_pick_no_lessons_message()}"
+
+def _pick_no_lessons_message() -> str:
+    """
+    Берём случайную фразу из ENV NO_LESSONS_MESSAGES (через |),
+    иначе из дефолтного списка выше.
+    Пример ENV: NO_LESSONS_MESSAGES="— Пар не найдено —|Свободно!|День без пар 🎉"
+    """
+    raw = os.getenv("NO_LESSONS_MESSAGES", "")
+    if raw.strip():
+        choices = [s.strip() for s in raw.split("|") if s.strip()]
+        if choices:
+            return random.choice(choices)
+    return random.choice(_NO_LESSONS_DEFAULT)
+
 def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -184,7 +213,6 @@ def _abbrev_subject(s: str) -> str:
     return t
 
 # ===== DAY (оставляем как было — многострочным, но без переносов внутри предмета) =====
-# ЗАМЕНИТЕ функцию format_day целиком
 
 def format_day(group: str, day: str, parity: str, lessons: List[Dict[str, str]]) -> str:
     """
@@ -199,7 +227,7 @@ def format_day(group: str, day: str, parity: str, lessons: List[Dict[str, str]])
         f"{('Чётная' if parity=='чёт' else 'Нечётная')} неделя • {_html_escape(day.title())}"
     )
     if not lessons:
-        return f"{header}\n{LONG_SEP}\n— Пар не найдено —"
+        return f"{header}\n{LONG_SEP}\n{_pick_no_lessons_message()}"
 
     blocks: List[str] = [header, LONG_SEP]
     history_emitted = False

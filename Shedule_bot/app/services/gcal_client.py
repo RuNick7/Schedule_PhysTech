@@ -156,6 +156,58 @@ def _headers(access_token: str) -> Dict[str, str]:
 
 
 # ======== Общие операции с календарями ========
+def list_calendars(telegram_id: int) -> List[Dict[str, Any]]:
+    """
+    Возвращает список календарей пользователя:
+    [{id, summary, primary: bool}, ...]
+    """
+    access = ensure_token(telegram_id)
+    url = f"{GCAL_API}/users/me/calendarList"
+    out: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+
+    while True:
+        params: Dict[str, Any] = {}
+        if page_token:
+            params["pageToken"] = page_token
+
+        r = requests.get(url, headers=_headers(access), params=params, timeout=15)
+        if r.status_code != 200:
+            raise GCalError(f"list_calendars failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        for it in data.get("items", []):
+            out.append({
+                "id": it["id"],
+                "summary": it.get("summary"),
+                "primary": bool(it.get("primary")),
+            })
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return out
+
+
+def create_calendar(telegram_id: int, title: str, tz: Optional[str] = None) -> str:
+    """
+    Создаёт новый календарь у пользователя. Возвращает его id.
+    """
+    access = ensure_token(telegram_id)
+    body = {
+        "summary": title,
+        "timeZone": tz or getattr(settings, "timezone", "Europe/Moscow"),
+    }
+    r = requests.post(
+        f"{GCAL_API}/calendars",
+        headers=_headers(access),
+        data=json.dumps(body),
+        timeout=15,
+    )
+    if r.status_code not in (200, 201):
+        raise GCalError(f"create_calendar failed: {r.status_code} {r.text}")
+    return r.json()["id"]
 
 def list_calendars(telegram_id: int) -> List[Dict[str, Any]]:
     """

@@ -17,14 +17,31 @@ from app.utils.subjects_alert import detect_special_subjects_in_matrix
 
 router = Router()
 
+_NO_LESSONS_DEFAULT = [
+    "— Пар не найдено —",
+    "Свободный день! ✨",
+    "Сегодня без пар — можно выдохнуть 🙂",
+    "Ничего в расписании. Береги силы 💪",
+    "Пары отсутствуют. Хорошего дня! 🌿",
+]
+
 # ---------- клавиатуры ----------
+def _kb_main_menu():
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Показать расписание", callback_data="main:schedule")
+    kb.button(text="⚙️ Настройки", callback_data="main:settings")
+    kb.button(text="📆 Google Calendar", callback_data="main:gcal")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
 def kb_schedule_root():
     kb = InlineKeyboardBuilder()
     kb.button(text="Сегодня", callback_data="sched:day:today")
     kb.button(text="Завтра", callback_data="sched:day:tomorrow")
     kb.button(text="Неделя", callback_data="sched:week:auto")
-    kb.button(text="Назад", callback_data="sched:back")
-    kb.adjust(2, 1, 1)
+    kb.button(text="Назад", callback_data="start:to_main")
+    kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
 def kb_day_controls(day_name: str, parity: str):
@@ -91,6 +108,11 @@ async def _send_or_edit(q: CallbackQuery, text: str, kb):
     await q.answer()
 
 # ---------- вход из главного меню ----------
+@router.callback_query(F.data == "start:to_main")
+async def to_main(q: CallbackQuery):
+    await q.message.edit_text("Готово! Что дальше?", reply_markup=_kb_main_menu())
+    await q.answer()
+
 @router.callback_query(F.data == "main:schedule")
 async def schedule_entry(q: CallbackQuery):
     user = get_user(q.from_user.id)
@@ -102,11 +124,6 @@ async def schedule_entry(q: CallbackQuery):
 # ---------- корень выбора периода ----------
 @router.callback_query(F.data == "sched:root")
 async def sched_root(q: CallbackQuery):
-    await _send_or_edit(q, "Выберите период:", kb_schedule_root())
-
-@router.callback_query(F.data == "sched:back")
-async def sched_back(q: CallbackQuery):
-    # для простоты возвращаемся в корневое меню выбора периода
     await _send_or_edit(q, "Выберите период:", kb_schedule_root())
 
 # ---------- сегодня / завтра ----------

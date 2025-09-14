@@ -18,7 +18,6 @@ def _get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def _conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -128,6 +127,18 @@ def set_autosend_mode(telegram_id: int, mode: int):
         conn.execute(
             "UPDATE users SET autosend_mode = ?, autosend_enabled = COALESCE(autosend_enabled, 0) WHERE telegram_id = ?",
             (mode, telegram_id),
+        )
+        conn.commit()
+
+def set_gcal_calendar_id(telegram_id: int, cal_id: Optional[str]):
+    """
+    Сохраняет выбранный пользователем calendarId (или None для сброса).
+    """
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute(
+            "UPDATE users SET gcal_calendar_id = ? WHERE telegram_id = ?",
+            (cal_id, telegram_id),
         )
         conn.commit()
 
@@ -325,8 +336,8 @@ def set_gcal_autosync_enabled(telegram_id: int, enabled: bool):
 
 def set_gcal_autosync_mode(telegram_id: int, mode: str):
     mode = (mode or "daily").lower()
-    if mode not in ("daily", "weekly"):
-        raise ValueError("gcal_autosync_mode must be 'daily' or 'weekly'")
+    if mode not in ("daily", "weekly", "rolling7", "weekly2"):  # <-- добавили weekly2
+        raise ValueError("gcal_autosync_mode must be 'daily', 'weekly', 'rolling7' or 'weekly2'")
     with _get_conn() as conn:
         _ensure_user_exists(conn, telegram_id)
         conn.execute("UPDATE users SET gcal_autosync_mode = ? WHERE telegram_id = ?", (mode, telegram_id))
