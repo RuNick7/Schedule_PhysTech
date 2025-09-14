@@ -46,8 +46,8 @@ def init_db():
                 autosend_last_date TEXT,                      -- 'YYYY-MM-DD'
 
                 -- режим 2
-                autosend_msg_id INTEGER,                      -- id сообщения «ближайшая»
-                autosend_cur_key TEXT                         -- ymd|time|subj|room
+                autosend_msg_id INTEGER,
+                autosend_cur_key TEXT,
                 
                 gcal_connected INTEGER DEFAULT 0,
                 gcal_access_token TEXT,

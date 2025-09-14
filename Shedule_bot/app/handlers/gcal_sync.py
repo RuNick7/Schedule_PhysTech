@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import asyncio
+from contextlib import suppress
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
 from aiogram import Router, F
@@ -144,6 +147,8 @@ async def gcal_create_separate(q: CallbackQuery):
 
 @router.callback_query(F.data == "gcal:sync:today")
 async def gcal_sync_today(q: CallbackQuery):
+    with suppress(TelegramBadRequest):
+        await q.answer("Синхронизация на сегодня…")
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
         await q.answer("Сначала подключите Google Calendar.", show_alert=True); return
@@ -152,6 +157,11 @@ async def gcal_sync_today(q: CallbackQuery):
     now = now_tz(tz)
     parity = week_parity_for_date(now, tz)
     day_upper = _weekday_upper(now)
+
+    try:
+        await q.message.edit_text("⏳ Синхронизирую расписание на сегодня…")
+    except Exception:
+        pass
 
     # пары пользователя
     lessons = await _load_lessons_for_user_group(u)
@@ -162,7 +172,7 @@ async def gcal_sync_today(q: CallbackQuery):
     for lesson in day_lessons:
         try:
             event, key = lesson_to_event(u, lesson, now)  # или dt_day
-            await q.bot.loop.run_in_executor(None, lambda: upsert_event(q.from_user.id, cal_id, event, key))
+            await asyncio.to_thread(upsert_event, q.from_user.id, cal_id, event, key)
             ok += 1
         except Exception as e:
             fail += 1
@@ -173,18 +183,39 @@ async def gcal_sync_today(q: CallbackQuery):
     # отметка о синхронизации
     try:
         from datetime import datetime, timezone
-        set_gcal_last_sync(q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        set_gcal_last_sync(
+            q.from_user.id,
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
     except Exception:
-        pass
+        log.exception("set_gcal_last_sync failed user=%s", q.from_user.id)
 
-    # Обновляем экран
-    msg = _status_text({**u, "telegram_id": q.from_user.id})
+    log.info("sync_today done user=%s ok=%d fail=%d", q.from_user.id, ok, fail)
+
+    # Перерисовываем экран статуса
+    u_ref = {**(get_user(q.from_user.id) or u), "telegram_id": q.from_user.id}
+    msg = _status_text(u_ref)
     msg += f"\n\nГотово: добавлено/обновлено {ok}, ошибок {fail}."
-    await q.message.edit_text(msg, reply_markup=_kb_root({**u, "telegram_id": q.from_user.id}), disable_web_page_preview=True)
-    await q.answer()
+    await q.message.edit_text(
+        msg,
+        reply_markup=_kb_root(u_ref),
+        disable_web_page_preview=True,
+    )
 
 @router.callback_query(F.data == "gcal:sync:week")
 async def gcal_sync_week(q: CallbackQuery):
+    # 1) МГНОВЕННО подтверждаем callback (чтобы не истёк)
+    with suppress(TelegramBadRequest):
+        await q.answer("Запускаю синхронизацию недели…")  # можно без текста
+
+    u = get_user(q.from_user.id)
+    if not u or not u.get("gcal_connected"):
+        # тут уже отвечать не надо — мы подтвердили выше
+        await q.message.answer("Сначала подключите Google Calendar.")
+        return
+
+    # (опционально) покажем пользователю, что процесс пошёл
+    await q.message.edit_text("⏳ Синхронизирую расписание на неделю…")
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
         await q.answer("Сначала подключите Google Calendar.", show_alert=True); return
@@ -204,29 +235,62 @@ async def gcal_sync_week(q: CallbackQuery):
     monday = base - timedelta(days=base.weekday())
 
     cal_id = u.get("gcal_calendar_id") or "primary"
+    log.info(
+        "sync_week start user=%s tz=%s parity=%s total=%d filtered=%d monday=%s cal=%s",
+        q.from_user.id, tz, parity, len(lessons), len(week_lessons),
+        monday.date().isoformat(), cal_id
+    )
     ok, fail = 0, 0
-    for lesson in week_lessons:
+    for idx, lesson in enumerate(week_lessons, 1):
         try:
-            offset = day_to_off[str(lesson["day"]).strip().upper()]
+            day_raw = str(lesson.get("day", "")).strip().upper()
+            if day_raw not in day_to_off:
+                fail += 1
+                log.error("sync_week bad day value: %r | lesson=%r", day_raw, lesson)
+                continue
+
+            offset = day_to_off[day_raw]
             dt_day = monday + timedelta(days=offset)
+
             event, key = lesson_to_event(u, lesson, dt_day)
-            await q.bot.loop.run_in_executor(
-                None, lambda: upsert_event(q.from_user.id, cal_id, event, key)
+
+            log.debug(
+                "sync_week build #%d key=%s summary=%r start=%s end=%s location=%r",
+                idx, key,
+                event.get("summary"),
+                (event.get("start") or {}).get("dateTime"),
+                (event.get("end") or {}).get("dateTime"),
+                event.get("location"),
+            )
+
+            created = await asyncio.to_thread(upsert_event, q.from_user.id, cal_id, event, key)
+
+            log.debug(
+                "sync_week upsert ok #%d id=%s status=%s link=%s",
+                idx, created.get("id"), created.get("status"), created.get("htmlLink")
             )
             ok += 1
+
         except Exception:
             fail += 1
+            log.exception(
+                "sync_week failed user=%s cal=%s idx=%d lesson=%r",
+                q.from_user.id, cal_id, idx, lesson
+            )
 
     try:
         from datetime import datetime, timezone
-        set_gcal_last_sync(q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        set_gcal_last_sync(
+            q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
     except Exception:
-        pass
+        log.exception("set_gcal_last_sync failed user=%s", q.from_user.id)
+
+    log.info("sync_week done user=%s ok=%d fail=%d", q.from_user.id, ok, fail)
 
     msg = _status_text({**u, "telegram_id": q.from_user.id})
     msg += f"\n\nГотово: добавлено/обновлено {ok}, ошибок {fail}."
-    await q.message.edit_text(msg, reply_markup=_kb_root({**u, "telegram_id": q.from_user.id}), disable_web_page_preview=True)
-    await q.answer()
+    await q.message.edit_text(msg, reply_markup=_kb_root({**u, "telegram_id": q.from_user.id}),disable_web_page_preview=True)
 
 # ---------- disconnect ----------
 

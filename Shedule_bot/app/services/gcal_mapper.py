@@ -9,20 +9,14 @@ import logging
 
 log = logging.getLogger("gcal.mapper")
 
-_TIME_RE = re.compile(
-    r"^\s*(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*$"
-)
+_TIME_RE = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*$")
 
-def _parse_time_range(time_str: str) -> Tuple[str, str]:
-    s = (time_str or "").replace("–", "-").replace("—", "-").strip()
-    try:
-        a, b = [t.strip() for t in s.split("-", 1)]
-        if len(a) == 5: a += ":00"
-        if len(b) == 5: b += ":00"
-        return a, b
-    except Exception:
-        log.exception("Bad time range: %r", time_str)
-        raise
+def _parse_time_range(time_str: str) -> tuple[str, str]:
+    m = _TIME_RE.match(time_str or "")
+    if not m:
+        raise ValueError(f"Bad time range: {time_str!r}")
+    h1, m1, h2, m2 = map(int, m.groups())
+    return f"{h1:02d}:{m1:02d}:00", f"{h2:02d}:{m2:02d}:00"
 
 def _rfc_date(dt: datetime) -> str:
     # YYYY-MM-DD
