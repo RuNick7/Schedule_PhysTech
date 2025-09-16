@@ -11,6 +11,7 @@ from app.services.db import (
 )
 from app.utils.dt import now_tz  # если у тебя другая утилита — используй её
 from app.handlers.gcal_sync import _sync_today_for_user, _sync_week_for_user  # добавим ниже
+from app.handlers.gcal_sync import _sync_two_weeks_for_user
 log = logging.getLogger("gcal.autosync")
 
 def _year_week(dt) -> str:
@@ -18,7 +19,7 @@ def _year_week(dt) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 async def gcal_autosync_tick(bot):
-    users = list_users_gcal_autosync_enabled()
+    users = list_users_gcal_autosync_enabled()   # твоя функция, которая отдаёт включённых
     if not users:
         return
     for u in users:
@@ -29,49 +30,25 @@ async def gcal_autosync_tick(bot):
             if hhmm != (u.get("gcal_autosync_time") or ""):
                 continue
 
-            mode = (u.get("gcal_autosync_mode") or "daily").lower()
+            mode = (u.get("gcal_autosync_mode") or "weekly").lower()
             last_key = u.get("gcal_autosync_last_key") or ""
             uid = u["telegram_id"]
 
-            if mode == "weekly":
-                wday = int(u.get("gcal_autosync_weekday") if u.get("gcal_autosync_weekday") is not None else 0)
-                if now_local.weekday() != wday:
-                    continue
-                key = f"weekly:{_year_week(now_local)}"
-                if key == last_key:
-                    continue
-                ok, fail = await _sync_week_for_user(uid, weeks_ahead=0)
-                set_gcal_autosync_last_key(uid, key)
-                log.info("autosync weekly user=%s ok=%d fail=%d", uid, ok, fail)
-
-            elif mode == "weekly2":  # <-- НОВОЕ
-                wday = int(u.get("gcal_autosync_weekday") if u.get("gcal_autosync_weekday") is not None else 0)
-                if now_local.weekday() != wday:
-                    continue
-                key = f"weekly2:{_year_week(now_local)}"   # один раз на базовую неделю
-                if key == last_key:
-                    continue
-                ok1, fail1 = await _sync_week_for_user(uid, weeks_ahead=0)  # текущая
-                ok2, fail2 = await _sync_week_for_user(uid, weeks_ahead=1)  # следующая
-                set_gcal_autosync_last_key(uid, key)
-                log.info("autosync weekly2 user=%s ok=%d fail=%d (w0:%d/%d, w1:%d/%d)",
-                         uid, ok1+ok2, fail1+fail2, ok1, fail1, ok2, fail2)
-
-            elif mode == "rolling7":
-                key = f"rolling7:{now_local.strftime('%Y-%m-%d')}"
-                if key == last_key:
-                    continue
-                ok, fail = await _sync_next_days_for_user(uid, days=7)
-                set_gcal_autosync_last_key(uid, key)
-                log.info("autosync rolling7 user=%s ok=%d fail=%d", uid, ok, fail)
-
-            else:  # daily
+            if mode == "daily":
                 key = f"daily:{now_local.strftime('%Y-%m-%d')}"
                 if key == last_key:
                     continue
-                ok, fail = await _sync_today_for_user(uid)
+                ok, fail = await _sync_today_for_user(uid)   # как у тебя было
                 set_gcal_autosync_last_key(uid, key)
                 log.info("autosync daily user=%s ok=%d fail=%d", uid, ok, fail)
+
+            else:  # weekly => КАЖДЫЙ ДЕНЬ, две недели
+                key = f"weekly2daily:{now_local.strftime('%Y-%m-%d')}"  # раз в день
+                if key == last_key:
+                    continue
+                ok, fail = await _sync_two_weeks_for_user(uid)
+                set_gcal_autosync_last_key(uid, key)
+                log.info("autosync weekly(2w daily) user=%s ok=%d fail=%d", uid, ok, fail)
 
         except Exception:
             log.exception("autosync tick failed for user=%s", u.get("telegram_id"))

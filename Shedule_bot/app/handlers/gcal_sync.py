@@ -425,93 +425,48 @@ async def gcal_sync_today(q: CallbackQuery):
 
 @router.callback_query(F.data == "gcal:sync:week")
 async def gcal_sync_week(q: CallbackQuery):
-    # 1) МГНОВЕННО подтверждаем callback (чтобы не истёк)
+    # мгновенно подтверждаем callback, чтобы не истёк
     with suppress(TelegramBadRequest):
-        await q.answer("Запускаю синхронизацию недели…")  # можно без текста
+        await q.answer("Синхронизирую 2 недели…")
 
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
-        # тут уже отвечать не надо — мы подтвердили выше
-        await q.message.answer("Сначала подключите Google Calendar.")
+        if q.message:
+            await q.message.answer("Сначала подключите Google Calendar.")
         return
 
-    # (опционально) покажем пользователю, что процесс пошёл
-    await q.message.edit_text("⏳ Синхронизирую расписание на неделю…")
-    u = get_user(q.from_user.id)
-    if not u or not u.get("gcal_connected"):
-        await q.answer("Сначала подключите Google Calendar.", show_alert=True); return
+    # покажем прогресс
+    if q.message:
+        await q.message.edit_text("⏳ Синхронизирую текущую и следующую недели…")
 
-    tz = u.get("timezone") or settings.timezone
-    # auto/чёт/нечёт мы уже обрабатываем в UI; здесь возьмём auto
-    from app.utils.week_parity import week_parity_for_date
-    parity = week_parity_for_date(None, tz)
-
+    # подгрузим все пары один раз
     lessons = await _load_lessons_for_user_group(u)
-    week_lessons = [it for it in lessons if it["parity"] == parity]
 
-    # Дата-референс: ближайший понедельник текущей недели
-    base = now_tz(tz)
-    # создадим мапу day->offset
-    day_to_off = {"ПОНЕДЕЛЬНИК":0,"ВТОРНИК":1,"СРЕДА":2,"ЧЕТВЕРГ":3,"ПЯТНИЦА":4,"СУББОТА":5,"ВОСКРЕСЕНЬЕ":6}
-    monday = base - timedelta(days=base.weekday())
+    # синхронизируем текущую и следующую недели
+    ok1, fail1 = await _sync_week_for_user({**u, "telegram_id": q.from_user.id}, lessons, weeks_ahead=0)
+    ok2, fail2 = await _sync_week_for_user({**u, "telegram_id": q.from_user.id}, lessons, weeks_ahead=1)
 
-    cal_id = u.get("gcal_calendar_id") or "primary"
-    log.info(
-        "sync_week start user=%s tz=%s parity=%s total=%d filtered=%d monday=%s cal=%s",
-        q.from_user.id, tz, parity, len(lessons), len(week_lessons),
-        monday.date().isoformat(), cal_id
-    )
-    ok, fail = 0, 0
-    for idx, lesson in enumerate(week_lessons, 1):
-        try:
-            day_raw = str(lesson.get("day", "")).strip().upper()
-            if day_raw not in day_to_off:
-                fail += 1
-                log.error("sync_week bad day value: %r | lesson=%r", day_raw, lesson)
-                continue
-
-            offset = day_to_off[day_raw]
-            dt_day = monday + timedelta(days=offset)
-
-            event, key = lesson_to_event(u, lesson, dt_day)
-
-            log.debug(
-                "sync_week build #%d key=%s summary=%r start=%s end=%s location=%r",
-                idx, key,
-                event.get("summary"),
-                (event.get("start") or {}).get("dateTime"),
-                (event.get("end") or {}).get("dateTime"),
-                event.get("location"),
-            )
-
-            created = await asyncio.to_thread(upsert_event, q.from_user.id, cal_id, event, key)
-
-            log.debug(
-                "sync_week upsert ok #%d id=%s status=%s link=%s",
-                idx, created.get("id"), created.get("status"), created.get("htmlLink")
-            )
-            ok += 1
-
-        except Exception:
-            fail += 1
-            log.exception(
-                "sync_week failed user=%s cal=%s idx=%d lesson=%r",
-                q.from_user.id, cal_id, idx, lesson
-            )
-
+    # отметим время
     try:
         from datetime import datetime, timezone
-        set_gcal_last_sync(
-            q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
+        set_gcal_last_sync(q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     except Exception:
         log.exception("set_gcal_last_sync failed user=%s", q.from_user.id)
 
-    log.info("sync_week done user=%s ok=%d fail=%d", q.from_user.id, ok, fail)
-
-    msg = _status_text({**u, "telegram_id": q.from_user.id})
-    msg += f"\n\nГотово: добавлено/обновлено {ok}, ошибок {fail}."
-    await q.message.edit_text(msg, reply_markup=_kb_root({**u, "telegram_id": q.from_user.id}),disable_web_page_preview=True)
+    # итоговый статус
+    u = get_user(q.from_user.id) or {}
+    u = {**u, "telegram_id": q.from_user.id}
+    msg = _status_text(u)
+    msg += (
+        f"\n\nГотово: добавлено/обновлено {ok1 + ok2}, ошибок {fail1 + fail2}."
+        f"\n(Текущая неделя: {ok1}/{fail1}, следующая: {ok2}/{fail2})"
+    )
+    if q.message:
+        await q.message.edit_text(
+            msg,
+            reply_markup=_kb_root(u),
+            disable_web_page_preview=True
+        )
 
 async def _sync_today_for_user(user_id: int) -> tuple[int,int]:
     u = get_user(user_id)
@@ -549,28 +504,25 @@ async def _sync_today_for_user(user_id: int) -> tuple[int,int]:
         pass
     return ok, fail
 
-async def _sync_week_for_user(user_id: int, weeks_ahead: int = 0) -> tuple[int,int]:
+async def _sync_week_for_user(u: dict, lessons: list[dict], weeks_ahead: int) -> tuple[int, int]:
     """
     Синхронизирует одну неделю пользователя.
-    weeks_ahead=0 — текущая неделя, =1 — следующая и т.д.
+    weeks_ahead=0 — текущая, 1 — следующая.
+    Возвращает (ok, fail).
     """
-    u = get_user(user_id)
-    if not u or not u.get("gcal_connected"):
-        return (0, 0)
     tz = u.get("timezone") or settings.timezone
-
     base = now_tz(tz)
-    monday = base - timedelta(days=base.weekday()) + timedelta(days=7*weeks_ahead)
+    monday = base - timedelta(days=base.weekday()) + timedelta(days=7 * weeks_ahead)
 
-    # чётность берём именно от понедельника той недели
+    # чётность именно той недели:
+    from app.utils.week_parity import week_parity_for_date
     parity = week_parity_for_date(monday, tz)
 
-    lessons = await _load_lessons_for_user_group(u)
+    # фильтр по чётности
+    def _norm(x): return str(x or "").strip().lower()
+    week_lessons = [it for it in lessons if _norm(it.get("parity")) == _norm(parity)]
 
-    def norm(x): return str(x or "").strip().lower()
-    week_lessons = [it for it in lessons if norm(it.get("parity")) == norm(parity)]
-
-    # (опционально) фильтрация «неизвестных по времени» предметов (например, ИСТОРИЯ «см. прилож.»)
+    # (если у тебя есть фильтр «история/см. прилож.» — применим)
     try:
         if '_is_hushed_unknown' in globals():
             week_lessons = [it for it in week_lessons if not _is_hushed_unknown(it)]
@@ -578,27 +530,81 @@ async def _sync_week_for_user(user_id: int, weeks_ahead: int = 0) -> tuple[int,i
         pass
 
     cal_id = u.get("gcal_calendar_id") or "primary"
-    day_to_off = {"ПОНЕДЕЛЬНИК":0,"ВТОРНИК":1,"СРЕДА":2,"ЧЕТВЕРГ":3,"ПЯТНИЦА":4,"СУББОТА":5,"ВОСКРЕСЕНЬЕ":6}
+    day_to_off = {
+        "ПОНЕДЕЛЬНИК": 0, "ВТОРНИК": 1, "СРЕДА": 2, "ЧЕТВЕРГ": 3,
+        "ПЯТНИЦА": 4, "СУББОТА": 5, "ВОСКРЕСЕНЬЕ": 6
+    }
 
     ok = fail = 0
-    for lesson in week_lessons:
+    for idx, lesson in enumerate(week_lessons, 1):
         try:
-            off = day_to_off[str(lesson["day"]).strip().upper()]
-            dt_day = monday + timedelta(days=off)
+            day_raw = str(lesson.get("day", "")).strip().upper()
+            if day_raw not in day_to_off:
+                fail += 1
+                log.error("sync_week[%s] bad day value: %r | lesson=%r", weeks_ahead, day_raw, lesson)
+                continue
+            dt_day = monday + timedelta(days=day_to_off[day_raw])
             event, key = lesson_to_event(u, lesson, dt_day)
-            await asyncio.to_thread(upsert_event, user_id, cal_id, event, key)
+            # idempotent upsert (без дублей)
+            await asyncio.to_thread(upsert_event, u["telegram_id"], cal_id, event, key)
             ok += 1
         except Exception:
             fail += 1
-            log.exception("sync_week core failed user=%s weeks_ahead=%s lesson=%r", user_id, weeks_ahead, lesson)
-
-    try:
-        from datetime import datetime, timezone
-        set_gcal_last_sync(user_id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    except Exception:
-        pass
+            log.exception("sync_week[%s] upsert failed user=%s lesson=%r", weeks_ahead, u["telegram_id"], lesson)
 
     return ok, fail
+
+
+# --- ХЕНДЛЕР: «Синхронизировать неделю» → СИНХ ДВУХ НЕДЕЛЬ ---
+@router.callback_query(F.data == "gcal:sync:week")
+async def gcal_sync_week(q: CallbackQuery):
+    # мгновенно подтверждаем callback, чтобы не истёк
+    with suppress(TelegramBadRequest):
+        await q.answer("Синхронизирую 2 недели…")
+
+    u = get_user(q.from_user.id)
+    if not u or not u.get("gcal_connected"):
+        if q.message:
+            await q.message.answer("Сначала подключите Google Calendar.")
+        return
+
+    # покажем прогресс
+    if q.message:
+        await q.message.edit_text("⏳ Синхронизирую текущую и следующую недели…")
+
+    # подгрузим все пары один раз
+    lessons = await _load_lessons_for_user_group(u)
+
+    # синхронизируем текущую и следующую недели
+    ok1, fail1 = await _sync_week_for_user({**u, "telegram_id": q.from_user.id}, lessons, weeks_ahead=0)
+    ok2, fail2 = await _sync_week_for_user({**u, "telegram_id": q.from_user.id}, lessons, weeks_ahead=1)
+
+    # отметим время
+    try:
+        from datetime import datetime, timezone
+        set_gcal_last_sync(q.from_user.id, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        log.exception("set_gcal_last_sync failed user=%s", q.from_user.id)
+
+    # итоговый статус
+    u = get_user(q.from_user.id) or {}
+    u = {**u, "telegram_id": q.from_user.id}
+    msg = _status_text(u)
+    msg += (
+        f"\n\nГотово: добавлено/обновлено {ok1 + ok2}, ошибок {fail1 + fail2}."
+        f"\n(Текущая неделя: {ok1}/{fail1}, следующая: {ok2}/{fail2})"
+    )
+    if q.message:
+        await q.message.edit_text(
+            msg,
+            reply_markup=_kb_root(u),
+            disable_web_page_preview=True
+        )
+
+async def _sync_two_weeks_for_user(user_id: int) -> tuple[int,int]:
+    ok1, fail1 = await _sync_week_for_user(user_id, weeks_ahead=0)  # текущая
+    ok2, fail2 = await _sync_week_for_user(user_id, weeks_ahead=1)  # следующая
+    return ok1+ok2, fail1+fail2
 
 # ---------- disconnect ----------
 
@@ -674,26 +680,18 @@ def _wd_name(i: int) -> str:
 def _mode_label(mode: str) -> str:
     return {
         "daily": "Ежедневно",
-        "weekly": "Еженедельно",
-        "weekly2": "Еженедельно (2 недели)",
+        "weekly": "Ежедневно (2 недели вперёд)",
     }[mode]
 
 def _kb_auto_settings(u: dict):
     a = get_gcal_autosync(u["telegram_id"])
-    mode = (a.get("gcal_autosync_mode") or "daily")
+    mode = (a.get("gcal_autosync_mode") or "weekly")  # weekly по умолчанию ок
     kb = InlineKeyboardBuilder()
     kb.button(text=("🟢 Вкл" if a.get("gcal_autosync_enabled") else "⚪️ Выкл"), callback_data="gcal:auto:toggle")
     kb.button(text=f"Режим: {_mode_label(mode)}", callback_data="gcal:auto:mode")
     kb.button(text=f"Время: {a.get('gcal_autosync_time') or '08:00'}", callback_data="gcal:auto:time")
-    if mode in ("weekly", "weekly2"):  # день недели нужен для обоих weekly-режимов
-        wday = int(a.get("gcal_autosync_weekday") if a.get("gcal_autosync_weekday") is not None else 0)
-        kb.button(text=f"День: {['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][wday]}", callback_data="gcal:auto:weekday")
     kb.button(text="⬅️ Назад", callback_data="gcal:open")
-    rows = [1,1,1]
-    if mode in ("weekly", "weekly2"):
-        rows.append(1)
-    rows.append(1)
-    kb.adjust(*rows)
+    kb.adjust(1,1,1,1)
     return kb.as_markup()
 
 @router.callback_query(F.data == "gcal:auto:open")
@@ -721,12 +719,10 @@ async def gcal_auto_toggle(q: CallbackQuery):
 @router.callback_query(F.data == "gcal:auto:mode")
 async def gcal_auto_mode(q: CallbackQuery):
     a = get_gcal_autosync(q.from_user.id)
-    mode = (a.get("gcal_autosync_mode") or "daily")
-    order = ["daily", "weekly", "weekly2", "rolling7"]  # <-- добавили weekly2
+    mode = (a.get("gcal_autosync_mode") or "weekly")
+    order = ["daily", "weekly"]
     new = order[(order.index(mode) + 1) % len(order)]
     set_gcal_autosync_mode(q.from_user.id, new)
-    if new in ("weekly", "weekly2") and a.get("gcal_autosync_weekday") is None:
-        set_gcal_autosync_weekday(q.from_user.id, 0)  # Пн по умолчанию
     await gcal_auto_open(q)
 
 # Простая сетка популярных времён
