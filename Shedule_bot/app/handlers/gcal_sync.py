@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -43,6 +44,22 @@ class AutoSyncTime(StatesGroup):
     waiting_time = State()
 
 # ---------- helpers ----------
+def _normalize_hhmm(raw: str) -> str | None:
+    """
+    '8:30', '08:30', '8-30', '8.30', '8 30', '0830' -> '08:30'
+    None, если формат невалиден.
+    """
+    if not raw:
+        return None
+    s = raw.strip().replace(".", ":").replace("-", ":").replace(" ", "")
+    m = re.fullmatch(r"(\d{1,2})(:?)(\d{2})?", s)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(3) or "00")
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return f"{hh:02d}:{mm:02d}"
 
 async def _sync_next_days_for_user(user_id: int, days: int = 7) -> tuple[int, int]:
     u = get_user(user_id)
@@ -745,17 +762,27 @@ async def gcal_auto_time_custom(q: CallbackQuery, state: FSMContext):
 
 @router.message(AutoSyncTime.waiting_time)
 async def gcal_auto_time_custom_set(m: Message, state: FSMContext):
-    text = (m.text or "").strip()
-    try:
-        # тут же сработает проверка формата 'HH:MM'
-        set_gcal_autosync_time(m.from_user.id, text)
-    except Exception as e:
-        await m.answer(f"⛔ {e}\nПопробуйте ещё раз, пример: <code>08:00</code>")
+    hhmm = _normalize_hhmm(m.text or "")
+    if not hhmm:
+        await m.answer("⛔ Неверный формат. Примеры: <b>8:30</b>, <b>08:30</b>, <b>8-30</b>, <b>0830</b>.")
         return
+    try:
+        # это пройдёт _TIME_RE ('HH:MM') в set_gcal_autosync_time
+        set_gcal_autosync_time(m.from_user.id, hhmm)
+    except Exception as e:
+        await m.answer(f"⛔ {e}\nПопробуйте ещё раз, пример: <code>08:30</code>")
+        return
+
     await state.clear()
-    await m.answer("✅ Время автосинхронизации сохранено.")
-    # вернём пользователя в экран настроек
-    # (если хочешь — можно отредактировать предыдущее сообщение, но проще отправить новое)
+    await m.answer(f"✅ Время автосинхронизации сохранено: <b>{hhmm}</b>")
+
+    # ВАЖНО: перерисовать экран из СВЕЖЕЙ БД, чтобы ты увидел новое время
+    u = get_user(m.from_user.id) or {}
+    try:
+        # если есть функция, которая строит клавиатуру настроек
+        await m.answer("⚙️ Настройки автосинхронизации", reply_markup=_kb_auto_settings(u))
+    except NameError:
+        pass
 
 
 @router.callback_query(F.data.startswith("gcal:auto:time:set:"))

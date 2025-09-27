@@ -189,6 +189,71 @@ def list_calendars(telegram_id: int) -> List[Dict[str, Any]]:
 
     return out
 
+def delete_events_by_tag_between(
+    telegram_id: int,
+    calendar_id: str,
+    tag_key: str = "sched_bot",
+    tag_value: str = "1",
+    time_min_iso: Optional[str] = None,  # RFC3339 с таймзоной, напр. '2025-09-15T00:00:00+03:00'
+    time_max_iso: Optional[str] = None,  # правая граница (исключительно)
+) -> int:
+    """
+    Удаляет все события пользователя в указанном календаре, помеченные
+    privateExtendedProperty (tag_key=tag_value) и попадающие в интервал [timeMin, timeMax).
+    Возвращает число удалённых.
+
+    ВАЖНО: time_min_iso/time_max_iso должны быть ISO 8601/RFC3339 с таймзоной.
+    Пример: '2025-09-15T00:00:00+03:00' ... '2025-09-29T00:00:00+03:00'
+    """
+    access = ensure_token(telegram_id)
+
+    url_list = f"{GCAL_API}/calendars/{urllib.parse.quote(calendar_id)}/events"
+    url_del_tpl = f"{GCAL_API}/calendars/{urllib.parse.quote(calendar_id)}/events/{{event_id}}"
+
+    deleted = 0
+    page_token = None
+    prop = f"{tag_key}={tag_value}"
+
+    base_params: Dict[str, str] = {
+        "privateExtendedProperty": prop,
+        "singleEvents": "true",
+        "showDeleted": "false",
+        "maxResults": "2500",
+        "orderBy": "startTime",
+    }
+    if time_min_iso:
+        base_params["timeMin"] = time_min_iso
+    if time_max_iso:
+        base_params["timeMax"] = time_max_iso
+
+    while True:
+        params = dict(base_params)
+        if page_token:
+            params["pageToken"] = page_token
+
+        r = requests.get(url_list, headers=_headers(access), params=params, timeout=20)
+        if r.status_code != 200:
+            raise GCalError(f"list events (window) failed: {r.status_code} {r.text}")
+        data = r.json()
+
+        for it in data.get("items", []):
+            ev_id = it["id"]
+            rdel = requests.delete(
+                url_del_tpl.format(event_id=urllib.parse.quote(ev_id)),
+                headers=_headers(access),
+                timeout=15,
+            )
+            if rdel.status_code in (204, 200):
+                deleted += 1
+            else:
+                # мягко игнорируем неуспех удаления отдельного события
+                pass
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return deleted
 
 def create_calendar(telegram_id: int, title: str, tz: Optional[str] = None) -> str:
     """

@@ -38,13 +38,11 @@ def init_db():
                 course INTEGER,
                 group_code TEXT,
 
-                -- автоотправка
-                autosend_enabled INTEGER NOT NULL DEFAULT 0,  -- 0/1
-                autosend_mode INTEGER,                        -- 1 или 2
-                autosend_time TEXT,                           -- 'HH:MM'
-                autosend_last_date TEXT,                      -- 'YYYY-MM-DD'
+                autosend_enabled INTEGER NOT NULL DEFAULT 0,
+                autosend_mode INTEGER,
+                autosend_time TEXT,
+                autosend_last_date TEXT,
 
-                -- режим 2
                 autosend_msg_id INTEGER,
                 autosend_cur_key TEXT,
                 

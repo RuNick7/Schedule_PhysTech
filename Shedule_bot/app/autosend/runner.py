@@ -30,6 +30,28 @@ log = logging.getLogger("autosend")
 
 DAY_NAMES_UPPER = ["ПОНЕДЕЛЬНИК","ВТОРНИК","СРЕДА","ЧЕТВЕРГ","ПЯТНИЦА","СУББОТА","ВОСКРЕСЕНЬЕ"]
 
+def _to_minutes(hhmm_or_hhmmss: str) -> int:
+    """
+    'HH:MM' или 'HH:MM:SS' -> минуты от полуночи.
+    Допускаем однозначные часы '9:05'.
+    """
+    parts = hhmm_or_hhmmss.strip().split(":")
+    h = int(parts[0])
+    m = int(parts[1]) if len(parts) > 1 else 0
+    return h * 60 + m
+
+def _parse_slot_minutes(slot: str) -> tuple[int, int]:
+    """
+    'HH:MM-HH:MM' или 'HH:MM:SS–HH:MM:SS' -> (start_min, end_min)
+    Поддерживаем дефис и en-dash.
+    """
+    s = slot.replace("–", "-").strip()
+    a, b = [x.strip() for x in s.split("-", 1)]
+    # Отрезаем секунды, если есть
+    a = a[:5] if len(a) >= 5 else a
+    b = b[:5] if len(b) >= 5 else b
+    return _to_minutes(a), _to_minutes(b)
+
 async def _build_day_text_for_user(user: dict) -> str:
     tz = getattr(settings, "timezone", "Europe/Moscow")
     dt_now = now_tz(tz)
@@ -49,6 +71,35 @@ async def _build_day_text_for_user(user: dict) -> str:
     # красивый вывод «на день»
     text = format_day(user["group_code"], day_upper, parity, day_lessons)
     return text
+
+def _pick_next_lesson(lessons: list[dict], now_minutes: int) -> dict | None:
+    """
+    Возвращает ближайшее занятие:
+      - если сейчас идёт пара (start <= now < end) — вернём её (status='ongoing')
+      - иначе — первую будущую (start >= now) (status='upcoming')
+      - если ничего не осталось — None
+    """
+    if not lessons:
+        return None
+
+    def _start_min(lesson: dict) -> int:
+        try:
+            sm, _ = _parse_slot_minutes(str(lesson.get("time", "")))
+            return sm
+        except Exception:
+            return 24 * 60 + 1  # в конец
+
+    for it in sorted(lessons, key=_start_min):
+        try:
+            sm, em = _parse_slot_minutes(str(it.get("time", "")))
+        except Exception:
+            continue
+        if sm <= now_minutes < em:
+            return {**it, "_status": "ongoing", "_start_min": sm, "_end_min": em}
+        if now_minutes <= sm:
+            return {**it, "_status": "upcoming", "_start_min": sm, "_end_min": em}
+
+    return None
 
 async def _morning_send_mode1(bot: Bot, hhmm: str, ymd: str):
     users = list_users_for_autosend_at(hhmm, mode=1)
