@@ -333,9 +333,6 @@ async def gcal_cal_select(q: CallbackQuery, state: FSMContext):
         set_gcal_calendar_id(q.from_user.id, cal_id)
     except Exception:
         log.exception("set_gcal_calendar_id failed user=%s id=%s", q.from_user.id, cal_id)
-
-    # вернуться на главный экран GCAL
-    from app.handlers.gcal_sync import gcal_open  # если функция в этом же файле — просто вызываем
     await gcal_open(q)
 
 @router.callback_query(F.data == "gcal:cal:create")
@@ -360,8 +357,6 @@ async def gcal_create_separate(q: CallbackQuery):
         await (q.message.answer if q.message else q.bot.send_message)(q.from_user.id, msg)
     except Exception:
         pass
-
-    from app.handlers.gcal_sync import gcal_open
     await gcal_open(q)
 
 @router.callback_query(F.data == "gcal:cal:primary")
@@ -530,9 +525,6 @@ async def _sync_week_for_user(u: dict, lessons: list[dict], weeks_ahead: int) ->
     tz = u.get("timezone") or settings.timezone
     base = now_tz(tz)
     monday = base - timedelta(days=base.weekday()) + timedelta(days=7 * weeks_ahead)
-
-    # чётность именно той недели:
-    from app.utils.week_parity import week_parity_for_date
     parity = week_parity_for_date(monday, tz)
 
     # фильтр по чётности

@@ -66,7 +66,8 @@ def _get_service(creds_path: Optional[str] = None, readonly: bool = True):
               ["https://www.googleapis.com/auth/spreadsheets"])
     path = _resolve_creds_path(creds_path)
     credentials = Credentials.from_service_account_file(path, scopes=scopes)
-    return build("sheets", "v4", credentials=credentials)
+    # ВАЖНО: cache_discovery=False, как в другом месте файла
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
 def fetch_sheet_grid(
     spreadsheet_id: Optional[str] = None,

@@ -26,7 +26,7 @@ def _safe_default_time() -> str:
 def _kb_root(mode: int | None, time_str: str):
     kb = InlineKeyboardBuilder()
     kb.button(
-        text=f"Режим: {'① Утром день' if mode == 1 else '② Ближайшая пара' if mode == 2 else '—'}",
+        text=f"Режим: {'① На день' if mode == 1 else '② Ближайшая пара' if mode == 2 else '—'}",
         callback_data="autosend:choose_mode"
     )
     kb.button(text=f"⏰ Время: {time_str}", callback_data="autosend:choose_time")
@@ -37,8 +37,8 @@ def _kb_root(mode: int | None, time_str: str):
 
 def _kb_modes():
     kb = InlineKeyboardBuilder()
-    kb.button(text="① Утром: расписание на день", callback_data="autosend:mode:1")
-    kb.button(text="② Утром: ближайшая пара (автообновление)", callback_data="autosend:mode:2")
+    kb.button(text="① Расписание на день", callback_data="autosend:mode:1")
+    kb.button(text="② Ближайшая пара", callback_data="autosend:mode:2")
     kb.button(text="⬅️ Назад", callback_data="autosend:open")
     kb.adjust(1, 1, 1)
     return kb.as_markup()
@@ -58,7 +58,7 @@ def _text_root(user) -> str:
     hhmm = user.get("autosend_time") or _safe_default_time()
     lines = ["<b>Автоотправка расписания</b>", "Статус: ✅ включена"]
     lines.append(f"Время отправки: {hhmm}")
-    lines.append(f"Режим: {'① Утром: расписание на день' if mode == 1 else '② Утром: ближайшая пара (автообновление)'}")
+    lines.append(f"Режим: {'① Расписание на день' if mode == 1 else '② Ближайшая пара'}")
     return "\n".join(lines)
 
 def _normalize_hhmm(s: str) -> str:
@@ -135,7 +135,7 @@ async def autosend_set_time(q: CallbackQuery):
     if val == "manual":
         return await autosend_time_manual_prompt(q)
     if val not in ALLOWED_TIMES:
-        await q.answer("Доступны быстрые варианты 06:00–08:00, либо введите своё время вручную.", show_alert=True); return
+        await q.answer("Выберите время.", show_alert=True); return
     set_autosend_time(q.from_user.id, val)
     await autosend_open(q)
 
@@ -143,7 +143,6 @@ async def autosend_set_time(q: CallbackQuery):
 async def autosend_time_manual_prompt(q: CallbackQuery):
     await q.message.edit_text(
         "Введите время в формате <b>HH:MM</b> (например, <b>06:45</b> или <b>9:05</b>).\n"
-        "Быстрые варианты доступны в меню: 06:00–08:00."
     )
     await q.answer()
 
