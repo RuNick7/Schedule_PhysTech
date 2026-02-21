@@ -11,6 +11,14 @@ log = logging.getLogger("gcal.mapper")
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*$")
 
+# Google Calendar event colorId mapping
+# https://developers.google.com/calendar/api/v3/reference/colors
+_COLOR_LECTURE = "9"   # blue
+_COLOR_PRACTICE = "10" # green
+_COLOR_LAB = "6"       # orange
+_COLOR_SPORT = "3"     # purple
+_COLOR_EXAM = "5"      # red (by request)
+
 def _parse_time_range(time_str: str) -> tuple[str, str]:
     m = _TIME_RE.match(time_str or "")
     if not m:
@@ -29,6 +37,27 @@ def _clean_subject(text: str) -> str:
     # или оставляем как есть.
     subj = text.strip()
     return subj.replace("\n", " ")
+
+
+def _pick_color_id(lesson: Dict[str, str]) -> Optional[str]:
+    src = " ".join(
+        [
+            str(lesson.get("subject") or ""),
+            str(lesson.get("text") or ""),
+        ]
+    ).lower().replace("ё", "е")
+
+    # Exams/credits/consultations have top priority.
+    if ("экзам" in src) or ("зачет" in src) or ("зачёт" in src) or ("консультац" in src):
+        return _COLOR_EXAM
+    if ("лаб." in src) or ("лаборатор" in src):
+        return _COLOR_LAB
+    if ("практ." in src) or ("практик" in src):
+        return _COLOR_PRACTICE
+    if ("лек." in src) or ("лекци" in src):
+        return _COLOR_LECTURE
+    # Fallback: anything else is treated as sport.
+    return _COLOR_SPORT
 
 def _build_sched_key(date_str: str, start_hms: str, lesson: Dict[str, str]) -> str:
     """
@@ -95,4 +124,7 @@ def lesson_to_event(
             "group": str(lesson.get("group") or ""),
         },
     )
+    color_id = _pick_color_id(lesson)
+    if color_id:
+        event["colorId"] = color_id
     return event, sched_key
