@@ -137,9 +137,31 @@ def oauth_callback(request: Request):
     except Exception as e:
         return HTMLResponse(f"<h3>Не удалось сохранить токены</h3><pre>{e}</pre>", status_code=500)
 
+    auto_calendar_note = ""
+    try:
+        # По умолчанию создаём отдельный календарь расписания и выбираем его.
+        from app.services.db import set_gcal_calendar_id  # type: ignore
+        from app.services.gcal_client import create_calendar  # type: ignore
+
+        user_after = get_user(tid) or user
+        if not user_after.get("gcal_calendar_id"):
+            title = f"Расписание ({user_after.get('group_code') or 'бот'})"
+            tz = user_after.get("timezone") or "Europe/Moscow"
+            cal_id = create_calendar(tid, title, tz)
+            set_gcal_calendar_id(tid, cal_id)
+            auto_calendar_note = (
+                "<p>Создан и выбран отдельный календарь для расписания ✅</p>"
+            )
+    except Exception:
+        auto_calendar_note = (
+            "<p>⚠️ Не удалось автоматически создать отдельный календарь. "
+            "Выберите/создайте календарь в боте вручную.</p>"
+        )
+
     # 4) показываем аккуратную страничку успеха
     return HTMLResponse(
         "<h3>Google Calendar подключён ✅</h3>"
+        f"{auto_calendar_note}"
         "<p>Теперь вернитесь в Telegram-бот и нажмите «Синхронизировать».</p>",
         status_code=200,
     )

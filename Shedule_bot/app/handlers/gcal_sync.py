@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from app.services.gcal_client import list_calendars, create_calendar
@@ -39,6 +40,7 @@ import logging
 log = logging.getLogger("gcal")
 
 router = Router()
+_GCAL_NAME_CACHE: dict[tuple[int, str], tuple[float, str]] = {}
 
 class AutoSyncTime(StatesGroup):
     waiting_time = State()
@@ -78,7 +80,9 @@ async def _sync_next_days_for_user(user_id: int, days: int = 7) -> tuple[int, in
     tz = u.get("timezone") or settings.timezone
     base = now_tz(tz)
     lessons = await _load_lessons_for_user_group(u)
-    cal_id = u.get("gcal_calendar_id") or "primary"
+    cal_id = u.get("gcal_calendar_id")
+    if not cal_id:
+        return (0, 0)
 
     ok = fail = 0
     day_to_off = {  # для названия дня из данных
@@ -131,6 +135,55 @@ def _public_base_url() -> str:
     # пробуем из pydantic-конфига; если нет — из ENV
     return (getattr(settings, "public_base_url", None) or os.getenv("PUBLIC_BASE_URL", "")).rstrip("/")
 
+
+def _calendar_label(cal_id: str | None, cal_title: str | None = None) -> str:
+    t = (cal_title or "").strip()
+    if t:
+        return t
+    c = (cal_id or "").strip()
+    if not c:
+        return "не выбран"
+    if c == "primary":
+        return "Primary"
+    if c.endswith("@group.calendar.google.com"):
+        return "Отдельный календарь"
+    return c
+
+
+async def _inject_calendar_title(u: dict, user_id: int) -> dict:
+    """
+    Обогащает user-словарь полем gcal_calendar_title, если можно получить
+    человекочитаемое имя календаря из Google.
+    """
+    out = dict(u or {})
+    cal_id = (out.get("gcal_calendar_id") or "").strip()
+    if not cal_id:
+        out["gcal_calendar_title"] = "не выбран"
+        return out
+    if cal_id == "primary":
+        out["gcal_calendar_title"] = "Primary"
+        return out
+
+    cache_key = (int(user_id), cal_id)
+    cached = _GCAL_NAME_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        out["gcal_calendar_title"] = cached[1]
+        return out
+
+    try:
+        cals = await asyncio.to_thread(list_calendars, user_id)
+        title = next((str(it.get("summary") or "").strip() for it in cals if it.get("id") == cal_id), "")
+        if title:
+            _GCAL_NAME_CACHE[cache_key] = (now + 300, title)
+            out["gcal_calendar_title"] = title
+        else:
+            out["gcal_calendar_title"] = _calendar_label(cal_id)
+    except Exception:
+        out["gcal_calendar_title"] = _calendar_label(cal_id)
+    return out
+
+
 def _oauth_connect_url(telegram_id: int) -> str:
     base = _public_base_url()
     if not base:
@@ -140,7 +193,7 @@ def _oauth_connect_url(telegram_id: int) -> str:
 def _kb_root(user: dict):
     kb = InlineKeyboardBuilder()
     connected = bool(user.get("gcal_connected"))
-    cal = user.get("gcal_calendar_id") or "primary"
+    cal = _calendar_label(user.get("gcal_calendar_id"), user.get("gcal_calendar_title"))
     if connected:
         kb.button(text="⚙️ Автосинхронизация", callback_data="gcal:auto:open")
         kb.button(text="🔄 Синхронизировать сегодня", callback_data="gcal:sync:today")
@@ -243,7 +296,7 @@ def _fmt_last_sync_human(u: dict) -> str:
 
 def _status_text(u: dict) -> str:
     connected = bool(u.get("gcal_connected"))
-    cal = u.get("gcal_calendar_id") or "primary"
+    cal = _calendar_label(u.get("gcal_calendar_id"), u.get("gcal_calendar_title"))
     last = _fmt_last_sync_human(u)
     lines = [
         "📆 <b>Google Calendar</b>",
@@ -272,6 +325,8 @@ async def gcal_open(q: CallbackQuery):
         await q.answer("Сначала /start", show_alert=True); return
     # добавим в объект user поле telegram_id, чтобы собрать URL с state
     u = {**u, "telegram_id": q.from_user.id}
+    if u.get("gcal_connected"):
+        u = await _inject_calendar_title(u, q.from_user.id)
     await q.message.edit_text(
         _status_text(u),
         reply_markup=_kb_root(u),
@@ -404,6 +459,9 @@ async def gcal_sync_today(q: CallbackQuery):
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
         await q.answer("Сначала подключите Google Calendar.", show_alert=True); return
+    if not u.get("gcal_calendar_id"):
+        await q.answer("Сначала выберите или создайте отдельный календарь в настройках Google Calendar.", show_alert=True)
+        return
 
     tz = u.get("timezone") or settings.timezone
     now = now_tz(tz)
@@ -419,7 +477,7 @@ async def gcal_sync_today(q: CallbackQuery):
     lessons = await _load_lessons_for_user_group(u)
     day_lessons = [it for it in lessons if _norm_parity(it.get("parity")) == _norm_parity(parity) and it["day"] == day_upper]
 
-    cal_id = u.get("gcal_calendar_id") or "primary"
+    cal_id = u.get("gcal_calendar_id")
     ok, fail = 0, 0
     for lesson in day_lessons:
         try:
@@ -473,7 +531,9 @@ async def _sync_today_for_user(user_id: int) -> tuple[int,int]:
         note = "⚠️ Сегодня есть " + ", ".join(subj_names) + ", но время не указано. Я не добавлял событие в календарь."
         # helper-функция без q: только логируем
         log.warning("sync_today user=%s: %s", user_id, note)
-    cal_id = u.get("gcal_calendar_id") or "primary"
+    cal_id = u.get("gcal_calendar_id")
+    if not cal_id:
+        return (0, 0)
     ok = fail = 0
     for lesson in today:
         try:
@@ -512,7 +572,9 @@ async def _sync_week_for_user(u: dict, lessons: list[dict], weeks_ahead: int) ->
     except Exception:
         pass
 
-    cal_id = u.get("gcal_calendar_id") or "primary"
+    cal_id = u.get("gcal_calendar_id")
+    if not cal_id:
+        return (0, 0)
     day_to_off = {
         "ПОНЕДЕЛЬНИК": 0, "ВТОРНИК": 1, "СРЕДА": 2, "ЧЕТВЕРГ": 3,
         "ПЯТНИЦА": 4, "СУББОТА": 5, "ВОСКРЕСЕНЬЕ": 6
@@ -549,6 +611,10 @@ async def gcal_sync_week(q: CallbackQuery):
     if not u or not u.get("gcal_connected"):
         if q.message:
             await q.message.answer("Сначала подключите Google Calendar.")
+        return
+    if not u.get("gcal_calendar_id"):
+        if q.message:
+            await q.message.answer("Сначала выберите или создайте отдельный календарь в настройках Google Calendar.")
         return
 
     # покажем прогресс
@@ -621,11 +687,11 @@ async def gcal_disconnect_confirm(q: CallbackQuery):
 
     action = q.data.rsplit(":", 1)[-1]  # keep|purge
     u = get_user(q.from_user.id) or {}
-    cal_id = u.get("gcal_calendar_id") or "primary"
+    cal_id = u.get("gcal_calendar_id")
 
     ok_deleted = 0
     try:
-        if action == "purge":
+        if action == "purge" and cal_id:
             # безопасно выполняем блокирующие вызовы в потоке
             from app.services.gcal_client import delete_events_by_tag  # type: ignore
             ok_deleted = await asyncio.to_thread(
