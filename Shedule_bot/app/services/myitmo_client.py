@@ -118,7 +118,7 @@ def _token_request_by_password(username: str, password: str, timeout: int = 20) 
             # Обычно это неверные учётные данные или изменившаяся форма логина.
             raise MyItmoError(
                 f"Не удалось получить authorization code (HTTP {form_resp.status_code}). "
-                "Проверьте MYITMO_USERNAME/MYITMO_PASSWORD."
+                "Проверьте логин и пароль my.itmo."
             )
 
         token_resp = session.post(

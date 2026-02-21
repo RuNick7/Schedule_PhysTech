@@ -435,3 +435,15 @@ def list_users_gcal_autosync_enabled() -> list[Dict[str, Any]]:
             "AND (gcal_autosync_time IS NOT NULL AND gcal_autosync_time <> '')"
         )
         return [dict(x) for x in cur.fetchall()]
+
+
+def list_user_ids_for_broadcast() -> List[int]:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT telegram_id
+            FROM users
+            WHERE telegram_id IS NOT NULL
+            """
+        )
+        return [int(r["telegram_id"]) for r in cur.fetchall() if r["telegram_id"]]

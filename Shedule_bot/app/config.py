@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     # Telegram
     bot_token: str = Field(alias="BOT_TOKEN")
+    admin_telegram_id: Optional[int] = Field(None, alias="ADMIN_TELEGRAM_ID")
 
     # Google Sheets
     spreadsheet_id: str = Field(alias="SPREADSHEET_ID")
@@ -43,8 +44,6 @@ class Settings(BaseSettings):
 
     # my.itmo (опционально, для обогащения данных расписания)
     myitmo_enabled: bool = Field(False, alias="MYITMO_ENABLED")
-    myitmo_username: Optional[str] = Field(None, alias="MYITMO_USERNAME")
-    myitmo_password: Optional[str] = Field(None, alias="MYITMO_PASSWORD")
     myitmo_timeout_sec: int = Field(20, alias="MYITMO_TIMEOUT_SEC")
 
     # --- нормализация путей относительно корня проекта ---
