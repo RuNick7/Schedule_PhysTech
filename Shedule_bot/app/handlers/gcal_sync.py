@@ -288,9 +288,10 @@ async def gcal_choose_calendar(q: CallbackQuery, state: FSMContext):
 
     u = get_user(q.from_user.id)
     if not u or not u.get("gcal_connected"):
-        await (q.message.answer if q.message else q.bot.send_message)(
-            q.from_user.id, "Сначала подключите Google Calendar."
-        )
+        if q.message:
+            await q.message.answer("Сначала подключите Google Calendar.")
+        else:
+            await q.bot.send_message(q.from_user.id, "Сначала подключите Google Calendar.")
         return
 
     # грузим список календарей в отдельном потоке
@@ -298,9 +299,10 @@ async def gcal_choose_calendar(q: CallbackQuery, state: FSMContext):
         cals = await asyncio.to_thread(list_calendars, q.from_user.id)
     except Exception:
         log.exception("list_calendars failed user=%s", q.from_user.id)
-        await (q.message.answer if q.message else q.bot.send_message)(
-            q.from_user.id, "Не удалось получить список календарей. Попробуйте позже."
-        )
+        if q.message:
+            await q.message.answer("Не удалось получить список календарей. Попробуйте позже.")
+        else:
+            await q.bot.send_message(q.from_user.id, "Не удалось получить список календарей. Попробуйте позже.")
         return
 
     # сохраняем мапу idx->calendarId в FSM (на одного пользователя)
@@ -323,9 +325,10 @@ async def gcal_cal_refresh(q: CallbackQuery, state: FSMContext):
         cals = await asyncio.to_thread(list_calendars, q.from_user.id)
     except Exception:
         log.exception("list_calendars failed user=%s", q.from_user.id)
-        await (q.message.answer if q.message else q.bot.send_message)(
-            q.from_user.id, "Не удалось обновить список календарей."
-        )
+        if q.message:
+            await q.message.answer("Не удалось обновить список календарей.")
+        else:
+            await q.bot.send_message(q.from_user.id, "Не удалось обновить список календарей.")
         return
 
     await state.update_data(gcal_calmap={str(i): it["id"] for i, it in enumerate(cals)})
@@ -375,7 +378,10 @@ async def gcal_create_separate(q: CallbackQuery):
 
     # показываем статус GCAL
     try:
-        await (q.message.answer if q.message else q.bot.send_message)(q.from_user.id, msg)
+        if q.message:
+            await q.message.answer(msg)
+        else:
+            await q.bot.send_message(q.from_user.id, msg)
     except Exception:
         pass
     await gcal_open(q)
