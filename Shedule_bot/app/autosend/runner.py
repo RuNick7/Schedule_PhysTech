@@ -16,9 +16,7 @@ from app.services.db import (
     set_autosend_cur_key,
     get_autosend_cur_key,
 )
-from app.services.sheets_client import fetch_sheet_grid
-from app.services.schedule_expand import expand_merged_matrix
-from app.services.schedule_list import list_lessons_matrix
+from app.services.lessons_loader import load_lessons_for_user_group
 from app.utils.week_parity import week_parity_for_date
 from app.utils.dt import now_tz
 from app.utils.format_schedule import format_day
@@ -29,6 +27,15 @@ from app.cron.gcal_autosync import gcal_autosync_tick
 log = logging.getLogger("autosend")
 
 DAY_NAMES_UPPER = ["ПОНЕДЕЛЬНИК","ВТОРНИК","СРЕДА","ЧЕТВЕРГ","ПЯТНИЦА","СУББОТА","ВОСКРЕСЕНЬЕ"]
+
+
+def _norm_parity(p: str) -> str:
+    p = str(p or "").strip().lower().replace("ё", "е")
+    if "неч" in p:
+        return "нечёт"
+    if "чет" in p:
+        return "чёт"
+    return p
 
 def _to_minutes(hhmm_or_hhmmss: str) -> int:
     """
@@ -58,15 +65,11 @@ async def _build_day_text_for_user(user: dict) -> str:
     parity = week_parity_for_date(dt_now, tz)
     day_upper = DAY_NAMES_UPPER[dt_now.weekday()]
 
-    # грузим расписание
-    sheet = fetch_sheet_grid(
-        spreadsheet_id=settings.spreadsheet_id,
-        sheet_gid=settings.sheet_gid,
-        creds_path=settings.google_credentials,
-    )
-    mtx = expand_merged_matrix(sheet)
-    lessons = [it for it in list_lessons_matrix(mtx) if it["group"] == user["group_code"]]
-    day_lessons = [it for it in lessons if it["parity"] == parity and str(it["day"]).strip().upper() == day_upper]
+    lessons = await load_lessons_for_user_group(user)
+    day_lessons = [
+        it for it in lessons
+        if _norm_parity(it.get("parity")) == _norm_parity(parity) and str(it["day"]).strip().upper() == day_upper
+    ]
 
     # красивый вывод «на день»
     text = format_day(user["group_code"], day_upper, parity, day_lessons)
@@ -218,14 +221,11 @@ async def _load_todays_lessons_for_user(user: dict):
     parity = week_parity_for_date(dt_now, tz)
     day_upper = DAY_NAMES_UPPER[dt_now.weekday()]
 
-    sheet = fetch_sheet_grid(
-        spreadsheet_id=settings.spreadsheet_id,
-        sheet_gid=settings.sheet_gid,
-        creds_path=settings.google_credentials,
-    )
-    mtx = expand_merged_matrix(sheet)
-    lessons = [it for it in list_lessons_matrix(mtx) if it["group"] == user["group_code"]]
-    day_lessons = [it for it in lessons if it["parity"] == parity and str(it["day"]).strip().upper() == day_upper]
+    lessons = await load_lessons_for_user_group(user)
+    day_lessons = [
+        it for it in lessons
+        if _norm_parity(it.get("parity")) == _norm_parity(parity) and str(it["day"]).strip().upper() == day_upper
+    ]
     return dt_now, parity, day_upper, day_lessons
 
 

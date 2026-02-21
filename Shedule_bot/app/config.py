@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_file: Optional[str] = Field(None, alias="LOG_FILE")
 
+    # my.itmo (опционально, для обогащения данных расписания)
+    myitmo_enabled: bool = Field(False, alias="MYITMO_ENABLED")
+    myitmo_username: Optional[str] = Field(None, alias="MYITMO_USERNAME")
+    myitmo_password: Optional[str] = Field(None, alias="MYITMO_PASSWORD")
+    myitmo_timeout_sec: int = Field(20, alias="MYITMO_TIMEOUT_SEC")
+
     # --- нормализация путей относительно корня проекта ---
     @field_validator("google_credentials", "db_path", "log_file", mode="before")
     @classmethod

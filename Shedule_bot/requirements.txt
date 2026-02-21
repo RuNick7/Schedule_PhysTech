@@ -16,6 +16,7 @@ python-dotenv>=1.0,<2
 # --- Google Sheets ---
 gspread>=6,<7
 google-auth>=2.27,<3           # для service_account в gspread
+google-api-python-client>=2,<3 # googleapiclient.discovery (Sheets API)
 
 # --- (Опционально, но полезно для OAuth) ---
 google-auth-oauthlib>=1.2,<2   # если решишь не руками обменивать код на токены

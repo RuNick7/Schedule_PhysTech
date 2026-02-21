@@ -1,12 +1,12 @@
 # app/services/db.py
 import os
 import sqlite3
-import datetime
+from datetime import datetime
 from typing import Optional, Dict, Any
 import re
 
 from app.config import settings
-from typing import List, Dict, Any, Optional
+from typing import List
 
 DB_PATH = settings.db_path  # ./app/data/bot.db
 
@@ -27,8 +27,8 @@ def _conn() -> sqlite3.Connection:
 def init_db():
     """Создать таблицу users (если её ещё нет)."""
     with _get_conn() as conn:
-        conn.execute(
-            """
+        # Актуальная схема users (без myitmo_password).
+        create_users_sql = """
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
                 telegram_tag TEXT,
@@ -37,6 +37,13 @@ def init_db():
                 timezone TEXT DEFAULT 'Europe/Moscow',
                 course INTEGER,
                 group_code TEXT,
+                schedule_source_mode TEXT DEFAULT 'sheets',
+                myitmo_username TEXT,
+                myitmo_access_token TEXT,
+                myitmo_refresh_token TEXT,
+                myitmo_token_expiry TEXT,
+                user_spreadsheet_id TEXT,
+                user_sheet_gid INTEGER,
 
                 autosend_enabled INTEGER NOT NULL DEFAULT 0,
                 autosend_mode INTEGER,
@@ -45,16 +52,66 @@ def init_db():
 
                 autosend_msg_id INTEGER,
                 autosend_cur_key TEXT,
-                
+
                 gcal_connected INTEGER DEFAULT 0,
                 gcal_access_token TEXT,
                 gcal_refresh_token TEXT,
                 gcal_token_expiry TEXT,
                 gcal_calendar_id TEXT,
-                gcal_last_sync TEXT
+                gcal_last_sync TEXT,
+
+                gcal_autosync_enabled INTEGER NOT NULL DEFAULT 0,
+                gcal_autosync_mode TEXT DEFAULT 'daily',
+                gcal_autosync_time TEXT,
+                gcal_autosync_weekday INTEGER,
+                gcal_autosync_last_key TEXT
             )
-            """
+        """
+        conn.execute(
+            create_users_sql
         )
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)")]
+        cols_set = set(cols)
+
+        # Миграция удаления устаревших колонок (SQLite: только через rebuild).
+        obsolete_cols = {"myitmo_password"}
+        if obsolete_cols & cols_set:
+            conn.execute("DROP TABLE IF EXISTS users_new")
+            conn.execute(create_users_sql.replace("users (", "users_new (", 1))
+            desired_cols = [r["name"] for r in conn.execute("PRAGMA table_info(users_new)")]
+            copy_cols = [c for c in desired_cols if c in cols_set]
+            if copy_cols:
+                joined = ", ".join(copy_cols)
+                conn.execute(f"INSERT INTO users_new ({joined}) SELECT {joined} FROM users")
+            conn.execute("DROP TABLE users")
+            conn.execute("ALTER TABLE users_new RENAME TO users")
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)")]
+            cols_set = set(cols)
+
+        if "schedule_source_mode" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN schedule_source_mode TEXT DEFAULT 'sheets'")
+        if "myitmo_username" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN myitmo_username TEXT")
+        if "myitmo_access_token" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN myitmo_access_token TEXT")
+        if "myitmo_refresh_token" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN myitmo_refresh_token TEXT")
+        if "myitmo_token_expiry" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN myitmo_token_expiry TEXT")
+        if "user_spreadsheet_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN user_spreadsheet_id TEXT")
+        if "user_sheet_gid" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN user_sheet_gid INTEGER")
+        if "gcal_autosync_enabled" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_enabled INTEGER NOT NULL DEFAULT 0")
+        if "gcal_autosync_mode" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_mode TEXT DEFAULT 'daily'")
+        if "gcal_autosync_time" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_time TEXT")
+        if "gcal_autosync_weekday" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_weekday INTEGER")
+        if "gcal_autosync_last_key" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_last_key TEXT")
         conn.commit()
 
 def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
@@ -94,6 +151,60 @@ def set_course(telegram_id: int, course: int) -> None:
 def set_group(telegram_id: int, group_code: str) -> None:
     with _conn() as con:
         con.execute("UPDATE users SET group_code = ? WHERE telegram_id = ?", (group_code, telegram_id))
+
+def set_schedule_source_mode(telegram_id: int, mode: str) -> None:
+    mode = str(mode or "").strip().lower()
+    if mode not in ("sheets", "myitmo_full", "hybrid"):
+        raise ValueError("schedule_source_mode must be 'sheets', 'myitmo_full' or 'hybrid'")
+    with _conn() as con:
+        con.execute("UPDATE users SET schedule_source_mode = ? WHERE telegram_id = ?", (mode, telegram_id))
+
+def clear_myitmo_credentials(telegram_id: int) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE users SET myitmo_username = NULL, "
+            "myitmo_access_token = NULL, myitmo_refresh_token = NULL, myitmo_token_expiry = NULL "
+            "WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+
+
+def set_myitmo_login(telegram_id: int, username: str) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE users SET myitmo_username = ?, "
+            "myitmo_access_token = NULL, myitmo_refresh_token = NULL, myitmo_token_expiry = NULL "
+            "WHERE telegram_id = ?",
+            (username, telegram_id),
+        )
+
+
+def set_myitmo_tokens(
+    telegram_id: int,
+    access_token: str,
+    refresh_token: str,
+    token_expiry_iso: str,
+) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE users SET myitmo_access_token = ?, myitmo_refresh_token = ?, "
+            "myitmo_token_expiry = ? WHERE telegram_id = ?",
+            (access_token, refresh_token, token_expiry_iso, telegram_id),
+        )
+
+def set_user_sheet_source(telegram_id: int, spreadsheet_id: str, sheet_gid: int) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE users SET user_spreadsheet_id = ?, user_sheet_gid = ? WHERE telegram_id = ?",
+            (spreadsheet_id, int(sheet_gid), telegram_id),
+        )
+
+def clear_user_sheet_source(telegram_id: int) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE users SET user_spreadsheet_id = NULL, user_sheet_gid = NULL WHERE telegram_id = ?",
+            (telegram_id,),
+        )
 
 def _ensure_user_exists(conn: sqlite3.Connection, telegram_id: int):
     cur = conn.execute("SELECT 1 FROM users WHERE telegram_id = ?", (telegram_id,))
@@ -154,28 +265,6 @@ def set_autosend_time(telegram_id: int, hhmm: str):
         )
         conn.commit()
 
-def list_users_for_autosend_at(hhmm: str) -> list[Dict[str, Any]]:
-    """
-    Пользователи, кому слать прямо сейчас:
-      - autosend_enabled = 1
-      - autosend_mode = 1
-      - autosend_time == hhmm
-      - group_code заполнен
-    """
-    with _get_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT * FROM users
-            WHERE autosend_enabled = 1
-              AND autosend_mode = 1
-              AND autosend_time = ?
-              AND group_code IS NOT NULL
-              AND group_code <> ''
-            """,
-            (hhmm,),
-        )
-        return [dict(r) for r in cur.fetchall()]
-
 def get_autosend_last_date(telegram_id: int) -> Optional[str]:
     with _get_conn() as conn:
         cur = conn.execute("SELECT autosend_last_date FROM users WHERE telegram_id = ?", (telegram_id,))
@@ -229,15 +318,6 @@ def migrate_gcal_autosync():
         add("gcal_autosync_last_key", "gcal_autosync_last_key TEXT")              # 'daily:YYYY-MM-DD' / 'weekly:YYYY-Www'
         conn.commit()
 
-
-def get_autosend_last_date(telegram_id: int) -> Optional[str]:
-    with _get_conn() as conn:
-        cur = conn.execute("SELECT autosend_last_date FROM users WHERE telegram_id = ?", (telegram_id,))
-        r = cur.fetchone()
-        return r["autosend_last_date"] if r else None
-
-from typing import Optional
-
 def set_autosend_message_id(telegram_id: int, msg_id: Optional[int]):
     with _get_conn() as conn:
         conn.execute(
@@ -270,29 +350,6 @@ def set_gcal_connected(telegram_id: int, connected: bool):
             "UPDATE users SET gcal_connected = ? WHERE telegram_id = ?",
             (1 if connected else 0, telegram_id),
         )
-        conn.commit()
-
-def set_gcal_tokens(telegram_id: int, access: str, refresh: Optional[str], expiry_iso: str):
-    with _get_conn() as conn:
-        conn.execute("INSERT OR IGNORE INTO users(telegram_id) VALUES (?)", (telegram_id,))
-        if refresh is not None:
-            conn.execute(
-                """
-                UPDATE users
-                SET gcal_access_token = ?, gcal_refresh_token = ?, gcal_token_expiry = ?
-                WHERE telegram_id = ?
-                """,
-                (access, refresh, expiry_iso, telegram_id),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE users
-                SET gcal_access_token = ?, gcal_token_expiry = ?
-                WHERE telegram_id = ?
-                """,
-                (access, expiry_iso, telegram_id),
-            )
         conn.commit()
 
 def set_gcal_tokens(telegram_id: int, access: str, refresh: Optional[str], expiry_iso: str):

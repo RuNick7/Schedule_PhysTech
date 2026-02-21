@@ -4,16 +4,14 @@ from typing import List
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
 from app.services.db import get_user, set_message_id
-from app.services.sheets_client import fetch_sheet_values_and_links
-from app.services.schedule_expand import expand_merged_matrix
-from app.services.schedule_list import list_lessons_matrix
+from app.services.lessons_loader import load_lessons_for_user_group
 from app.utils.week_parity import week_parity_for_date
 from app.utils.dt import now_tz
 from app.utils.format_schedule import format_day, format_week_compact_mono
 from app.config import settings
-from app.utils.subjects_alert import detect_special_subjects_in_matrix
 
 router = Router()
 
@@ -85,6 +83,7 @@ def kb_week_controls(parity: str):
     kb.button(text="Сегодня", callback_data="sched:day:today")
     kb.button(text="Назад", callback_data="sched:root")
     kb.adjust(1, 1, 1)  # каждая кнопка на своей строке, «Назад» — в самом низу
+    return kb.as_markup()
 
 # ---------- вспомогательное ----------
 
@@ -94,21 +93,24 @@ def _russian_day_name(dt) -> str:
     return names[dt.weekday()]
 
 async def _load_lessons_for_user_group(user: dict):
-    vals, links, merges = fetch_sheet_values_and_links(
-        spreadsheet_id=settings.spreadsheet_id,
-        sheet_gid=settings.sheet_gid,
-        creds_path=settings.google_credentials,
-    )
-    mtx_vals  = expand_merged_matrix(vals, merges=merges)
-    mtx_links = expand_merged_matrix(links, merges=merges)
-    all_lessons = list_lessons_matrix(mtx_vals, mtx_links)
-    return [it for it in all_lessons if it["group"] == user["group_code"]]
+    return await load_lessons_for_user_group(user)
+
+
+def _norm_parity(p: str) -> str:
+    p = str(p or "").strip().lower().replace("ё", "е")
+    if "неч" in p:
+        return "нечёт"
+    if "чет" in p:
+        return "чёт"
+    return p
 
 def _filter_by_day_and_parity(lessons: List[dict], day_name: str, parity: str) -> List[dict]:
-    return [it for it in lessons if str(it["day"]).strip().upper() == day_name and it["parity"] == parity]
+    np = _norm_parity(parity)
+    return [it for it in lessons if str(it["day"]).strip().upper() == day_name and _norm_parity(it.get("parity")) == np]
 
 def _filter_by_parity(lessons: List[dict], parity: str) -> List[dict]:
-    return [it for it in lessons if it["parity"] == parity]
+    np = _norm_parity(parity)
+    return [it for it in lessons if _norm_parity(it.get("parity")) == np]
 
 async def _send_or_edit(q: CallbackQuery, text: str, kb):
     user = get_user(q.from_user.id)
@@ -121,7 +123,11 @@ async def _send_or_edit(q: CallbackQuery, text: str, kb):
                 text=text,
                 reply_markup=kb
             )
-            await q.answer()
+            try:
+                await q.answer()
+            except TelegramBadRequest:
+                # callback мог протухнуть, если загрузка заняла >10-15 сек
+                pass
             return
         except Exception:
             pass  # упало редактирование — отправим новое и обновим message_id
@@ -129,7 +135,10 @@ async def _send_or_edit(q: CallbackQuery, text: str, kb):
     m = await q.message.answer(text, reply_markup=kb, disable_web_page_preview=True)
     if user and user.get("type") == 1:
         set_message_id(q.from_user.id, m.message_id)
-    await q.answer()
+    try:
+        await q.answer()
+    except TelegramBadRequest:
+        pass
 
 # ---------- вход из главного меню ----------
 @router.callback_query(F.data == "start:to_main")
@@ -170,7 +179,7 @@ async def sched_day_today_tomorrow(q: CallbackQuery):
 
     # пары для пользователя
     lessons = await _load_lessons_for_user_group(user)
-    day_lessons = [it for it in lessons if it["parity"] == parity and it["day"] == day_upper]
+    day_lessons = [it for it in lessons if _norm_parity(it.get("parity")) == _norm_parity(parity) and it["day"] == day_upper]
 
     text = format_day(user["group_code"], day_upper, parity, day_lessons)
 
@@ -190,19 +199,13 @@ async def sched_day_same(q: CallbackQuery):
         await q.answer("Сначала выберите группу.", show_alert=True)
         return
 
-    # грузим значения и ссылки (для Zoom)
-    vals, links, merges = fetch_sheet_values_and_links(
-        spreadsheet_id=settings.spreadsheet_id,
-        sheet_gid=settings.sheet_gid,
-        creds_path=settings.google_credentials,
-    )
-    mtx_vals = expand_merged_matrix(vals, merges=merges)
-    mtx_links = expand_merged_matrix(links, merges=merges)
-    all_lessons = list_lessons_matrix(mtx_vals, mtx_links)
-    group_lessons = [it for it in all_lessons if it["group"] == user["group_code"]]
+    group_lessons = await _load_lessons_for_user_group(user)
 
     day_upper = str(day_name).strip().upper()
-    day_lessons = [it for it in group_lessons if it["parity"] == parity and it["day"] == day_upper]
+    day_lessons = [
+        it for it in group_lessons
+        if _norm_parity(it.get("parity")) == _norm_parity(parity) and it["day"] == day_upper
+    ]
 
     text = format_day(user["group_code"], day_upper, parity, day_lessons)
     await _send_or_edit(q, text, kb_day_controls(day_upper, parity))
@@ -219,17 +222,8 @@ async def sched_week(q: CallbackQuery):
     if parity == "auto":
         parity = week_parity_for_date(None, tz)
 
-    # значения + ссылки (для Zoom)
-    vals, links, merges = fetch_sheet_values_and_links(
-        spreadsheet_id=settings.spreadsheet_id,
-        sheet_gid=settings.sheet_gid,
-        creds_path=settings.google_credentials,
-    )
-    mtx_vals = expand_merged_matrix(vals, merges=merges)
-    mtx_links = expand_merged_matrix(links, merges=merges)
-    lessons_all = list_lessons_matrix(mtx_vals, mtx_links)
-    lessons_grp = [it for it in lessons_all if it["group"] == user["group_code"]]
-    week_lessons = [it for it in lessons_grp if it["parity"] == parity]
+    lessons_grp = await _load_lessons_for_user_group(user)
+    week_lessons = [it for it in lessons_grp if _norm_parity(it.get("parity")) == _norm_parity(parity)]
 
     text = format_week_compact_mono(user["group_code"], parity, week_lessons)
 
@@ -250,7 +244,10 @@ async def sched_week(q: CallbackQuery):
                 text=text,
                 reply_markup=kb.as_markup()
             )
-            await q.answer()
+            try:
+                await q.answer()
+            except TelegramBadRequest:
+                pass
             return
         except Exception:
             pass
@@ -258,4 +255,7 @@ async def sched_week(q: CallbackQuery):
     m = await q.message.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
     if user.get("type") == 1:
         set_message_id(q.from_user.id, m.message_id)
-    await q.answer()
+    try:
+        await q.answer()
+    except TelegramBadRequest:
+        pass

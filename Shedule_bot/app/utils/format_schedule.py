@@ -1,7 +1,6 @@
 # app/utils/format_schedule.py
 from __future__ import annotations
 
-from idlelib.pyparse import trans
 from typing import List, Dict, Tuple
 import re
 import random
@@ -174,7 +173,11 @@ def _dedupe_teachers_prefer_rich(teachers: list[str]) -> list[str]:
             if (rich > cur_rich) or (rich == cur_rich and len(disp) > len(cur_disp)):
                 best[key] = (rich, disp)
 
-    return [best[k][1] for k in order]
+    # Если по одной фамилии есть вариант с инициалами,
+    # голую фамилию убираем (иначе получаем "Иванов И.И., Иванов").
+    has_detailed_surname = {k[0] for k in best if k[1]}
+    filtered_order = [k for k in order if not (k[1] == "" and k[0] in has_detailed_surname)]
+    return [best[k][1] for k in filtered_order]
 
 def _strip_teachers(text: str) -> str:
     """
@@ -376,3 +379,5 @@ def format_week_compact_mono(group: str, parity: str, lessons: List[Dict[str, st
 
     if out and out[-1] == WEEK_SEP:
         out.pop()
+
+    return "\n".join(out)

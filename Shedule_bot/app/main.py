@@ -1,26 +1,26 @@
 # app/main.py
 import asyncio
-from app.bot import bot, dp
-from app.utils.logging import setup_logging
-from app.services.db import init_db
-from app.handlers import start, menu  # noqa: F401
-from app.autosend.runner import start_autosend
-from app.services.db import migrate_gcal_autosync
-import os, logging, sys
+import logging
+import os
+import sys
 
-# >>> логирование — в самом верху файла!
-import logging, os, sys
+from app.bot import bot, dp
+from app.handlers import start, menu  # noqa: F401
+from app.services.db import init_db, migrate_gcal_autosync
+from app.autosend.runner import start_autosend
+from app.utils.logging import setup_logging
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,  # перебивает чужие конфиги
+    force=True,
 )
 logging.getLogger("aiogram").setLevel(logging.INFO)
 logging.getLogger("gcal").setLevel(logging.DEBUG)
 logging.getLogger("gcal.api").setLevel(logging.DEBUG)
 logging.getLogger("gcal.mapper").setLevel(logging.DEBUG)
-print(">>> BOT STARTED", flush=True)
+
 
 async def main():
     setup_logging()

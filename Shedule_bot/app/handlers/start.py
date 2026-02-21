@@ -8,7 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.handlers.menu import open_settings as menu_open_settings
 
 from app.services.db import (
-    init_db, upsert_user, get_user, set_course, set_group, set_message_id
+    init_db, upsert_user, get_user, set_course, set_group, set_message_id, set_schedule_source_mode
 )
 from app.services.groups import list_groups_for_course
 
@@ -38,6 +38,31 @@ def _kb_main_menu():
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
+def _kb_source_mode(prefix: str = "start"):
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="🧩 Только таблица (как раньше)",
+        callback_data=f"{prefix}:source:sheets",
+    )
+    kb.button(
+        text="🎓 Только my.itmo (полная интеграция)",
+        callback_data=f"{prefix}:source:myitmo_full",
+    )
+    kb.button(
+        text="🔀 Таблица + my.itmo (частичное дополнение)",
+        callback_data=f"{prefix}:source:hybrid",
+    )
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+def _source_mode_label(mode: str | None) -> str:
+    m = (mode or "sheets").strip().lower()
+    if m == "myitmo_full":
+        return "Только my.itmo"
+    if m == "hybrid":
+        return "Таблица + my.itmo"
+    return "Только таблица"
+
 @router.message(CommandStart())
 async def start_cmd(msg: Message):
     # Инициализация и апдейт t.me/username
@@ -45,11 +70,26 @@ async def start_cmd(msg: Message):
     upsert_user(msg.from_user.id, msg.from_user.username)
     user = get_user(msg.from_user.id)
 
+    # 0) Первый запуск — выбираем режим источника расписания
+    if user and not user.get("schedule_source_mode"):
+        m = await msg.answer(
+            "Как получать расписание?\n\n"
+            "🧩 <b>Только таблица</b> — текущий режим, как раньше.\n"
+            "🎓 <b>Только my.itmo</b> — берём всё расписание из my.itmo.\n"
+            "🔀 <b>Таблица + my.itmo</b> — основа из таблицы, "
+            "а для пар типа англ./история дополняем аудиторию и преподавателя из my.itmo.",
+            reply_markup=_kb_source_mode("start"),
+        )
+        set_message_id(msg.from_user.id, m.message_id)
+        return
+
     # 1) Есть группа → сразу главное меню
     if user and user.get("group_code"):
         text = (
             f"С возвращением, <b>{msg.from_user.full_name}</b>!\n"
-            f"Текущая группа: <b>{user['group_code']}</b>.\n\nВыберите действие:"
+            f"Текущая группа: <b>{user['group_code']}</b>.\n"
+            f"Источник: <b>{_source_mode_label(user.get('schedule_source_mode'))}</b>.\n\n"
+            "Выберите действие:"
         )
         m = await msg.answer(text, reply_markup=_kb_main_menu())
         set_message_id(msg.from_user.id, m.message_id)
@@ -71,6 +111,38 @@ async def start_cmd(msg: Message):
         reply_markup=_kb_courses()
     )
     set_message_id(msg.from_user.id, m.message_id)
+
+@router.callback_query(F.data.startswith("start:source:"))
+async def choose_source_mode(q: CallbackQuery):
+    mode = q.data.split(":")[-1]
+    set_schedule_source_mode(q.from_user.id, mode)
+    user = get_user(q.from_user.id) or {}
+
+    # Есть группа → сразу меню
+    if user.get("group_code"):
+        await q.message.edit_text(
+            f"Режим источника: <b>{_source_mode_label(mode)}</b>\n\nЧто дальше?",
+            reply_markup=_kb_main_menu(),
+        )
+        await q.answer("Режим сохранён")
+        return
+
+    # Есть курс → выбор группы
+    if user.get("course"):
+        course = int(user["course"])
+        await q.message.edit_text(
+            f"Режим источника: <b>{_source_mode_label(mode)}</b>\n\n"
+            f"Курс: <b>{course}</b>\nТеперь выбери <b>группу</b>:",
+            reply_markup=_kb_groups(course),
+        )
+        await q.answer("Режим сохранён")
+        return
+
+    await q.message.edit_text(
+        f"Режим источника: <b>{_source_mode_label(mode)}</b>\n\nВыбери <b>курс</b>:",
+        reply_markup=_kb_courses(),
+    )
+    await q.answer("Режим сохранён")
 
 @router.callback_query(F.data.startswith("start:course:"))
 async def choose_course(q: CallbackQuery):

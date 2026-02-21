@@ -2,8 +2,7 @@
 from __future__ import annotations
 import asyncio
 import logging
-import timedelta
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.handlers.gcal_sync import _sync_next_days_for_user
 from app.services.gcal_client import delete_events_by_tag_between
 from app.config import settings
@@ -48,13 +47,8 @@ async def gcal_autosync_tick(bot):
             cal_id = u.get("gcal_calendar_id") or "primary"
 
             if mode == "daily":
-                # как раньше (оставляешь свой код или готовую функцию sync_today_for_user)
-                # ok, fail = await sync_today_for_user(uid)
-                # при желании можно чистить окно только сегодняшнего дня:
-                # start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-                # end_local   = (start_local + timedelta(days=1))
-                # await asyncio.to_thread(delete_events_by_tag_between, uid, cal_id, "sched_bot", "1", start_local.isoformat(), end_local.isoformat())
-                ok, fail = 0, 0
+                # Синхронизируем только текущий день.
+                ok, fail = await _sync_next_days_for_user(uid, days=1)
             else:
                 # === Чистка окна текущая+следующая недели ===
                 base = now_local
