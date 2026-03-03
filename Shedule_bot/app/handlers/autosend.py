@@ -5,6 +5,8 @@ import re
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
 from app.services.db import (
     get_user,
@@ -18,6 +20,9 @@ router = Router()
 
 TIME_RE = re.compile(r"^(?:[0-1]?\d|2[0-3]):[0-5]\d$")  # допускаем '6:05' и '06:05'
 ALLOWED_TIMES = ["06:00", "06:30", "07:00", "07:30", "08:00"]
+
+class AutoSendTime(StatesGroup):
+    waiting_time = State()
 
 def _safe_default_time() -> str:
     t = getattr(settings, "autosend_default_time", "07:30")
@@ -130,26 +135,30 @@ async def autosend_choose_time(q: CallbackQuery):
     await q.answer()
 
 @router.callback_query(F.data.startswith("autosend:time:"))
-async def autosend_set_time(q: CallbackQuery):
-    val = q.data.split(":")[-1]
+async def autosend_set_time(q: CallbackQuery, state: FSMContext):
+    prefix = "autosend:time:"
+    val = q.data[len(prefix):]
     if val == "manual":
-        return await autosend_time_manual_prompt(q)
+        return await autosend_time_manual_prompt(q, state)
     if val not in ALLOWED_TIMES:
         await q.answer("Выберите время.", show_alert=True); return
     set_autosend_time(q.from_user.id, val)
+    await state.clear()
     await autosend_open(q)
 
 @router.callback_query(F.data == "autosend:time:manual")
-async def autosend_time_manual_prompt(q: CallbackQuery):
+async def autosend_time_manual_prompt(q: CallbackQuery, state: FSMContext):
+    await state.set_state(AutoSendTime.waiting_time)
     await q.message.edit_text(
         "Введите время в формате <b>HH:MM</b> (например, <b>06:45</b> или <b>9:05</b>).\n"
     )
     await q.answer()
 
-@router.message(F.text.regexp(TIME_RE))
-async def autosend_time_manual_set(msg: Message):
+@router.message(AutoSendTime.waiting_time, F.text.regexp(TIME_RE))
+async def autosend_time_manual_set(msg: Message, state: FSMContext):
     from app.services.db import set_autosend_time, get_user
     hhmm = _normalize_hhmm(msg.text)
     set_autosend_time(msg.from_user.id, hhmm)
+    await state.clear()
     u = get_user(msg.from_user.id)
     await msg.answer(f"⏰ Время обновлено: <b>{hhmm}</b>.\nОткройте меню автоотправки для проверки.")
