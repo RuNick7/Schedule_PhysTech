@@ -26,6 +26,9 @@ log = logging.getLogger("isu.indexer")
 
 _isu_session: Optional[IsuSession] = None
 _indexer_task: Optional[asyncio.Task] = None
+_isu_throttle_seq: int = 0
+
+_LOGIN_ATTEMPTS = 5
 
 
 def get_shared_isu_session() -> Optional[IsuSession]:
@@ -40,7 +43,19 @@ def _index_credentials() -> tuple[str, str]:
 
 
 def _http_timeout_sec() -> int:
-    return max(30, int(settings.isu_http_timeout_sec or 90))
+    return max(60, int(settings.isu_http_timeout_sec or 180))
+
+
+async def _isu_throttle_before_request() -> None:
+    """Паузы перед запросом к ИСУ (аналог ITMOStalk: меньше нагрузка — меньше обрывов)."""
+    global _isu_throttle_seq
+    _isu_throttle_seq += 1
+    pause = max(0.0, float(settings.isu_index_request_pause_sec))
+    if pause:
+        await asyncio.sleep(pause)
+    extra = float(settings.isu_index_extra_pause_sec or 0.0)
+    if extra > 0 and _isu_throttle_seq % 2 == 0:
+        await asyncio.sleep(extra)
 
 
 async def _login_isu_with_retries() -> IsuSession:
@@ -53,7 +68,7 @@ async def _login_isu_with_retries() -> IsuSession:
 
     timeout = _http_timeout_sec()
     last_err: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, _LOGIN_ATTEMPTS + 1):
         try:
             isu = IsuSession(timeout=timeout)
             await asyncio.to_thread(isu.authenticate_by_password, login, password)
@@ -63,20 +78,23 @@ async def _login_isu_with_retries() -> IsuSession:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, OSError) as e:
             last_err = e
             log.warning(
-                "ISU login attempt %d/3 failed (%s): %s",
+                "ISU login attempt %d/%d failed (%s): %s",
                 attempt,
+                _LOGIN_ATTEMPTS,
                 type(e).__name__,
                 e,
             )
-            if attempt < 3:
-                await asyncio.sleep(5 * attempt)
+            if attempt < _LOGIN_ATTEMPTS:
+                await asyncio.sleep(min(45, 6 * attempt))
         except requests.exceptions.RequestException as e:
             last_err = e
-            log.warning("ISU login attempt %d/3 failed: %s", attempt, e)
-            if attempt < 3:
-                await asyncio.sleep(5 * attempt)
+            log.warning(
+                "ISU login attempt %d/%d failed: %s", attempt, _LOGIN_ATTEMPTS, e
+            )
+            if attempt < _LOGIN_ATTEMPTS:
+                await asyncio.sleep(min(45, 6 * attempt))
 
-    msg = f"ИСУ недоступен после 3 попыток"
+    msg = f"ИСУ недоступен после {_LOGIN_ATTEMPTS} попыток"
     if last_err:
         msg += f": {last_err}"
     raise IsuSessionError(msg)
@@ -167,13 +185,18 @@ async def _indexer_loop() -> None:
             await _ensure_session()
             assert _isu_session is not None
 
+            global _isu_throttle_seq
+            _isu_throttle_seq = 0
+
             set_meta("indexer_status", "fetching_groups")
+            await _isu_throttle_before_request()
             groups = await asyncio.to_thread(fetch_group_list, _isu_session)
             save_groups(groups)
             log.info("Indexed %d groups", len(groups))
             await asyncio.sleep(delay)
 
             set_meta("indexer_status", "fetching_potoks")
+            await _isu_throttle_before_request()
             potoks = await asyncio.to_thread(fetch_potok_list, _isu_session)
             save_potoks(potoks)
             log.info("Indexed %d potoks", len(potoks))
@@ -183,6 +206,7 @@ async def _indexer_loop() -> None:
             backoff = delay
             for idx, (group_enc, group_name) in enumerate(groups, 1):
                 try:
+                    await _isu_throttle_before_request()
                     students = await asyncio.to_thread(
                         fetch_students_for_group, _isu_session, group_enc
                     )
@@ -205,6 +229,7 @@ async def _indexer_loop() -> None:
 
                     await _ensure_session()
                     try:
+                        await _isu_throttle_before_request()
                         students = await asyncio.to_thread(
                             fetch_students_for_group, _isu_session, group_enc
                         )

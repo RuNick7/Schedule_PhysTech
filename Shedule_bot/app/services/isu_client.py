@@ -41,10 +41,16 @@ class IsuSessionError(RuntimeError):
 class IsuSession:
     """Authenticated ISU session with nonce for APEX pages."""
 
-    def __init__(self, timeout: int = 90):
+    def __init__(self, timeout: int = 180):
         self._timeout = timeout
         self.session: Optional[requests.Session] = None
         self.nonce: Optional[str] = None
+
+    def _connect_read_timeouts(self) -> Tuple[float, float]:
+        """Короткий connect, длинный read — типичный ReadTimeout на стороне ИСУ."""
+        read = float(max(30, int(self._timeout)))
+        connect = min(60.0, max(12.0, read / 5.0))
+        return (connect, read)
 
     def authenticate_by_token(self, refresh_token: str) -> None:
         """
@@ -71,7 +77,7 @@ class IsuSession:
                 "client_id": _CLIENT_ID,
                 "refresh_token": refresh_token,
             },
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
         token_resp.raise_for_status()
         token_data = token_resp.json()
@@ -93,7 +99,7 @@ class IsuSession:
                 "code_challenge": code_challenge,
             },
             allow_redirects=True,
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
 
         if "loginAction" in (auth_resp.text or "") and "code=" not in str(auth_resp.url):
@@ -122,7 +128,7 @@ class IsuSession:
                     "code_verifier": code_verifier,
                 },
                 allow_redirects=False,
-                timeout=self._timeout,
+                timeout=self._connect_read_timeouts(),
             )
             exch.raise_for_status()
             exch_data = exch.json()
@@ -130,14 +136,14 @@ class IsuSession:
 
         # Закрепить сессию my.itmo (часто нужно перед переходом в ИСУ)
         try:
-            sess.get("https://my.itmo.ru/", allow_redirects=True, timeout=self._timeout)
+            sess.get("https://my.itmo.ru/", allow_redirects=True, timeout=self._connect_read_timeouts())
         except Exception:
             pass
 
         isu_resp = sess.get(
             f"{_ISU_BASE}/pls/apex/f?p=2143:1",
             allow_redirects=True,
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
         isu_resp.raise_for_status()
 
@@ -184,7 +190,7 @@ class IsuSession:
                 "code_challenge_method": "S256",
                 "code_challenge": code_challenge,
             },
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
         auth_resp.raise_for_status()
 
@@ -194,13 +200,13 @@ class IsuSession:
             data={"username": username, "password": password},
             cookies=auth_resp.cookies,
             allow_redirects=True,
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
 
         isu_resp = sess.get(
             f"{_ISU_BASE}/pls/apex/f?p=2143:1",
             allow_redirects=True,
-            timeout=self._timeout,
+            timeout=self._connect_read_timeouts(),
         )
         isu_resp.raise_for_status()
 
@@ -224,7 +230,7 @@ class IsuSession:
     def get(self, url: str, **kwargs) -> requests.Response:
         if not self.session:
             raise IsuSessionError("Not authenticated")
-        kwargs.setdefault("timeout", self._timeout)
+        kwargs.setdefault("timeout", self._connect_read_timeouts())
         return self.session.get(url, **kwargs)
 
 
