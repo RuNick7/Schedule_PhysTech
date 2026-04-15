@@ -41,7 +41,7 @@ class IsuSessionError(RuntimeError):
 class IsuSession:
     """Authenticated ISU session with nonce for APEX pages."""
 
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 90):
         self._timeout = timeout
         self.session: Optional[requests.Session] = None
         self.nonce: Optional[str] = None

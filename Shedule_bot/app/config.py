@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     # ISU schedule lookup: один сервисный аккаунт ИСУ для индексации и загрузки HTML
     isu_index_login: Optional[str] = Field(None, alias="ISU_INDEX_LOGIN")
     isu_index_password: Optional[str] = Field(None, alias="ISU_INDEX_PASSWORD")
+    # ИСУ иногда отвечает дольше 30 с — иначе ReadTimeout на isu.ifmo.ru
+    isu_http_timeout_sec: int = Field(90, alias="ISU_HTTP_TIMEOUT_SEC")
     isu_index_delay: float = Field(2.0, alias="ISU_INDEX_DELAY")
     isu_cache_db: str = Field(
         str(ROOT_DIR / "app" / "data" / "isu_cache.db"), alias="ISU_CACHE_DB"

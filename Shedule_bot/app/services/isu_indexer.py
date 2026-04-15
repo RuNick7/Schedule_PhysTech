@@ -5,6 +5,8 @@ import logging
 import traceback
 from typing import Optional
 
+import requests
+
 from app.config import settings
 from app.services.isu_client import (
     IsuSession,
@@ -37,6 +39,49 @@ def _index_credentials() -> tuple[str, str]:
     return login, password
 
 
+def _http_timeout_sec() -> int:
+    return max(30, int(settings.isu_http_timeout_sec or 90))
+
+
+async def _login_isu_with_retries() -> IsuSession:
+    """Вход в ИСУ по паре ISU_INDEX_* с повторами при таймауте/обрыве."""
+    login, password = _index_credentials()
+    if not login or not password:
+        raise IsuSessionError(
+            "Не заданы ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env"
+        )
+
+    timeout = _http_timeout_sec()
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            isu = IsuSession(timeout=timeout)
+            await asyncio.to_thread(isu.authenticate_by_password, login, password)
+            return isu
+        except IsuSessionError:
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, OSError) as e:
+            last_err = e
+            log.warning(
+                "ISU login attempt %d/3 failed (%s): %s",
+                attempt,
+                type(e).__name__,
+                e,
+            )
+            if attempt < 3:
+                await asyncio.sleep(5 * attempt)
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            log.warning("ISU login attempt %d/3 failed: %s", attempt, e)
+            if attempt < 3:
+                await asyncio.sleep(5 * attempt)
+
+    msg = f"ИСУ недоступен после 3 попыток"
+    if last_err:
+        msg += f": {last_err}"
+    raise IsuSessionError(msg)
+
+
 async def get_service_isu_session() -> Optional[IsuSession]:
     """
     Сессия ИСУ для загрузки расписаний: общая с индексатором или новая по ISU_INDEX_*.
@@ -58,10 +103,12 @@ async def get_service_isu_session() -> Optional[IsuSession]:
             pass
 
     try:
-        isu = IsuSession(timeout=30)
-        await asyncio.to_thread(isu.authenticate_by_password, login, password)
+        isu = await _login_isu_with_retries()
         _isu_session = isu
         return isu
+    except IsuSessionError as e:
+        log.warning("get_service_isu_session: %s", e)
+        return None
     except Exception as e:
         log.warning("get_service_isu_session: auth failed: %s", e)
         return None
@@ -92,9 +139,7 @@ async def _ensure_session() -> None:
         except Exception:
             pass
 
-    isu = IsuSession(timeout=30)
-    await asyncio.to_thread(isu.authenticate_by_password, login, password)
-    _isu_session = isu
+    _isu_session = await _login_isu_with_retries()
 
 
 async def _indexer_loop() -> None:
@@ -149,12 +194,12 @@ async def _indexer_loop() -> None:
                             idx,
                             len(groups),
                         )
-                except (ConnectionError, OSError) as e:
+                except (ConnectionError, OSError, requests.exceptions.Timeout) as e:
                     log.warning(
-                        "Rate-limited at group %d/%d (%s), backing off %.0fs",
-                        idx, len(groups), group_name, backoff,
+                        "Network/rate issue at group %d/%d (%s), backing off %.0fs: %s",
+                        idx, len(groups), group_name, backoff, e,
                     )
-                    set_meta("last_error", f"rate-limit at group {idx}: {e}")
+                    set_meta("last_error", f"group {idx}: {e}")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 120)
 
