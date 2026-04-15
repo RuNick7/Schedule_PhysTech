@@ -447,3 +447,20 @@ def list_user_ids_for_broadcast() -> List[int]:
             """
         )
         return [int(r["telegram_id"]) for r in cur.fetchall() if r["telegram_id"]]
+
+
+def get_any_myitmo_user() -> Optional[Dict[str, Any]]:
+    """Return any user that has a valid my.itmo refresh_token (for ISU indexer)."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT * FROM users
+            WHERE myitmo_refresh_token IS NOT NULL
+              AND myitmo_refresh_token <> ''
+              AND myitmo_username IS NOT NULL
+              AND myitmo_username <> ''
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None

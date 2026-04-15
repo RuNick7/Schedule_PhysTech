@@ -46,8 +46,14 @@ class Settings(BaseSettings):
     myitmo_enabled: bool = Field(False, alias="MYITMO_ENABLED")
     myitmo_timeout_sec: int = Field(20, alias="MYITMO_TIMEOUT_SEC")
 
+    # ISU schedule lookup (ITMOStalk-like) — credentials per-user from DB
+    isu_index_delay: float = Field(2.0, alias="ISU_INDEX_DELAY")
+    isu_cache_db: str = Field(
+        str(ROOT_DIR / "app" / "data" / "isu_cache.db"), alias="ISU_CACHE_DB"
+    )
+
     # --- нормализация путей относительно корня проекта ---
-    @field_validator("google_credentials", "db_path", "log_file", mode="before")
+    @field_validator("google_credentials", "db_path", "log_file", "isu_cache_db", mode="before")
     @classmethod
     def _expand_path(cls, v: Optional[str]) -> Optional[str]:
         if not v:

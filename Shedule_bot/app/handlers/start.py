@@ -33,9 +33,10 @@ def _kb_main_menu():
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     kb.button(text="📅 Показать расписание", callback_data="main:schedule")
+    kb.button(text="🔍 Чужое расписание", callback_data="main:isu_schedule")
     kb.button(text="⚙️ Настройки", callback_data="main:settings")
     kb.button(text="📆 Google Calendar", callback_data="main:gcal")
-    kb.adjust(1, 1, 1)
+    kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
 def _kb_source_mode(prefix: str = "start"):
