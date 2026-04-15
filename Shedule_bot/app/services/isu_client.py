@@ -21,6 +21,17 @@ from app.services.myitmo_client import (
 log = logging.getLogger("isu.client")
 
 _ISU_BASE = "https://isu.ifmo.ru"
+# Nonce в ссылках APEX: f?p=2143:9:1234567890::...
+_NONCE_RE = re.compile(r"f\?p=2143:\d+:(\d{8,})", re.I)
+
+
+def _looks_like_isu_login_page(html: str) -> bool:
+    low = (html or "").lower()
+    if "kc-form-login" in low or 'name="username"' in low:
+        return True
+    if "парол" in low and ("вход" in low or "login" in low):
+        return True
+    return False
 
 
 class IsuSessionError(RuntimeError):
@@ -39,15 +50,18 @@ class IsuSession:
         """
         Establish ISU session using a my.itmo refresh_token.
         Steps:
-        1. Refresh the token via Keycloak token endpoint (sets session cookies)
-        2. Start a new OAuth code flow — Keycloak recognises the session and
-           auto-redirects without showing the login page
-        3. Follow redirects into ISU and extract the APEX nonce
+        1. Refresh the token via Keycloak (establishes SSO cookies for id.itmo.ru)
+        2. Start OAuth2 PKCE — Keycloak may auto-approve and redirect to
+           my.itmo.ru/login/callback?code=...
+        3. Exchange authorization_code for tokens in the same session (required
+           for a complete browser-like session; without this ISU often stays logged out)
+        4. Open ISU and extract the APEX nonce from the page or redirects
         """
         sess = requests.Session()
         sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (schedule-bot ISU indexer)",
-            "Accept-Language": "ru-RU,ru;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         })
 
         token_resp = sess.post(
@@ -82,14 +96,43 @@ class IsuSession:
             timeout=self._timeout,
         )
 
-        final_url = str(auth_resp.url)
-        redirected_ok = "code=" in final_url or "callback" in final_url
-
-        if not redirected_ok and "loginAction" in auth_resp.text:
+        if "loginAction" in (auth_resp.text or "") and "code=" not in str(auth_resp.url):
             raise IsuSessionError(
-                "Keycloak requires password — refresh_token session cookies "
-                "are not sufficient for SSO. User must reconnect my.itmo."
+                "Keycloak требует пароль — сессии refresh_token недостаточно. "
+                "Откройте Настройки → my.itmo и подключите аккаунт заново."
             )
+
+        final_url = str(auth_resp.url)
+        parsed = urllib.parse.urlparse(final_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        auth_code = (qs.get("code") or [None])[0]
+        if not auth_code:
+            m_code = re.search(r"[?&]code=([^&]+)", final_url)
+            if m_code:
+                auth_code = urllib.parse.unquote(m_code.group(1))
+
+        if auth_code:
+            exch = sess.post(
+                f"{_PROVIDER}/protocol/openid-connect/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": _CLIENT_ID,
+                    "redirect_uri": _REDIRECT_URI,
+                    "code": auth_code,
+                    "code_verifier": code_verifier,
+                },
+                allow_redirects=False,
+                timeout=self._timeout,
+            )
+            exch.raise_for_status()
+            exch_data = exch.json()
+            new_refresh = exch_data.get("refresh_token") or new_refresh
+
+        # Закрепить сессию my.itmo (часто нужно перед переходом в ИСУ)
+        try:
+            sess.get("https://my.itmo.ru/", allow_redirects=True, timeout=self._timeout)
+        except Exception:
+            pass
 
         isu_resp = sess.get(
             f"{_ISU_BASE}/pls/apex/f?p=2143:1",
@@ -98,13 +141,19 @@ class IsuSession:
         )
         isu_resp.raise_for_status()
 
+        html_text = isu_resp.text or ""
+        if _looks_like_isu_login_page(html_text) and not _NONCE_RE.search(html_text):
+            raise IsuSessionError(
+                "ИСУ вернул страницу входа. Подключите my.itmo в настройках бота заново."
+            )
+
         nonce = self._extract_nonce(str(isu_resp.url))
         if not nonce:
-            nonce = self._extract_nonce(isu_resp.text)
+            nonce = self._extract_nonce(html_text)
         if not nonce:
             raise IsuSessionError(
-                "Could not extract ISU nonce after token-based auth. "
-                "Try reconnecting my.itmo."
+                "Не удалось получить nonce ИСУ после входа. "
+                "Попробуйте отключить и снова подключить my.itmo в настройках."
             )
 
         self.session = sess
@@ -167,7 +216,9 @@ class IsuSession:
 
     @staticmethod
     def _extract_nonce(text: str) -> Optional[str]:
-        m = re.search(r"f\?p=2143:\d+:(\d{10,})", text)
+        if not text:
+            return None
+        m = _NONCE_RE.search(text)
         return m.group(1) if m else None
 
     def get(self, url: str, **kwargs) -> requests.Response:
