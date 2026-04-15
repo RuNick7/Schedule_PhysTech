@@ -24,7 +24,7 @@ from app.services.isu_db import (
     search_potoks_by_group,
     search_students_by_fio,
 )
-from app.services.isu_indexer import get_shared_isu_session
+from app.services.isu_indexer import get_service_isu_session
 from app.services.isu_schedule_parser import parse_schedule_html
 
 log = logging.getLogger("isu.handler")
@@ -323,24 +323,17 @@ async def isu_select_potok(q: CallbackQuery):
 
 # ── schedule fetching and formatting ────────────────────────────────────
 
-async def _get_isu_session_for_user(telegram_id: int) -> IsuSession:
+async def _get_isu_session_for_user(_telegram_id: int) -> IsuSession:
     """
-    Try the shared indexer session first.
-    Fall back to creating a per-user session from their refresh_token.
+    Загрузка расписаний с ИСУ — только через сервисный аккаунт (ISU_INDEX_* в .env).
+    Доступ к кнопке у пользователя всё равно только при подключённом my.itmo.
     """
-    shared = get_shared_isu_session()
-    if shared and shared.session:
-        return shared
-
-    user = get_user(telegram_id)
-    if not user or not user.get("myitmo_refresh_token"):
-        raise IsuSessionError("my.itmo не подключен. Подключите в Настройках.")
-
-    isu = IsuSession(timeout=30)
-    await asyncio.to_thread(
-        isu.authenticate_by_token, user["myitmo_refresh_token"]
+    isu = await get_service_isu_session()
+    if isu:
+        return isu
+    raise IsuSessionError(
+        "Сервер не настроен: укажите ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env."
     )
-    return isu
 
 
 async def _fetch_and_show_schedule_cb(
@@ -462,8 +455,11 @@ def _format_index_status(progress: Dict) -> str:
     g_indexed = progress.get("groups_indexed", 0)
     p_total = progress.get("potoks_total", 0)
 
-    if status == "waiting_for_user":
-        return "Ожидание: ни один пользователь ещё не подключил my.itmo.\n"
+    if status == "waiting_credentials":
+        return (
+            "Индексатор ждёт учётные данные: задайте ISU_INDEX_LOGIN и "
+            "ISU_INDEX_PASSWORD в .env на сервере.\n"
+        )
 
     if status == "idle" and g_total == 0:
         return "Индексация ещё не запускалась.\n"

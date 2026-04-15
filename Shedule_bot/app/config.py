@@ -46,7 +46,9 @@ class Settings(BaseSettings):
     myitmo_enabled: bool = Field(False, alias="MYITMO_ENABLED")
     myitmo_timeout_sec: int = Field(20, alias="MYITMO_TIMEOUT_SEC")
 
-    # ISU schedule lookup (ITMOStalk-like) — credentials per-user from DB
+    # ISU schedule lookup: один сервисный аккаунт ИСУ для индексации и загрузки HTML
+    isu_index_login: Optional[str] = Field(None, alias="ISU_INDEX_LOGIN")
+    isu_index_password: Optional[str] = Field(None, alias="ISU_INDEX_PASSWORD")
     isu_index_delay: float = Field(2.0, alias="ISU_INDEX_DELAY")
     isu_cache_db: str = Field(
         str(ROOT_DIR / "app" / "data" / "isu_cache.db"), alias="ISU_CACHE_DB"

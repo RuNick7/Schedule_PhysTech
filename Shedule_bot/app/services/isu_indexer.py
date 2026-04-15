@@ -14,7 +14,6 @@ from app.services.isu_client import (
     fetch_students_for_group,
 )
 from app.services.isu_db import (
-    get_meta,
     save_groups,
     save_potoks,
     save_students_for_group,
@@ -32,41 +31,95 @@ def get_shared_isu_session() -> Optional[IsuSession]:
     return _isu_session
 
 
+def _index_credentials() -> tuple[str, str]:
+    login = (settings.isu_index_login or "").strip()
+    password = (settings.isu_index_password or "").strip()
+    return login, password
+
+
+async def get_service_isu_session() -> Optional[IsuSession]:
+    """
+    Сессия ИСУ для загрузки расписаний: общая с индексатором или новая по ISU_INDEX_*.
+    """
+    global _isu_session
+    login, password = _index_credentials()
+    if not login or not password:
+        return None
+
+    if _isu_session is not None and _isu_session.session is not None:
+        try:
+            resp = await asyncio.to_thread(
+                _isu_session.get,
+                f"https://isu.ifmo.ru/pls/apex/f?p=2143:1:{_isu_session.nonce}",
+            )
+            if resp.status_code == 200 and "2143" in resp.text:
+                return _isu_session
+        except Exception:
+            pass
+
+    try:
+        isu = IsuSession(timeout=30)
+        await asyncio.to_thread(isu.authenticate_by_password, login, password)
+        _isu_session = isu
+        return isu
+    except Exception as e:
+        log.warning("get_service_isu_session: auth failed: %s", e)
+        return None
+
+
 def start_isu_indexer() -> None:
-    """Launch background indexer. Uses the first available user with my.itmo connected."""
     global _indexer_task
     _indexer_task = asyncio.ensure_future(_indexer_loop())
     log.info("ISU indexer task scheduled")
 
 
-async def _get_refresh_token() -> Optional[str]:
-    """Find any user with a valid my.itmo refresh_token in the DB."""
-    from app.services.db import get_any_myitmo_user
-    user = await asyncio.to_thread(get_any_myitmo_user)
-    if user and user.get("myitmo_refresh_token"):
-        return user["myitmo_refresh_token"]
-    return None
+async def _ensure_session() -> None:
+    global _isu_session
+    login, password = _index_credentials()
+    if not login or not password:
+        raise IsuSessionError(
+            "Не заданы ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env"
+        )
+
+    if _isu_session is not None and _isu_session.session is not None:
+        try:
+            resp = await asyncio.to_thread(
+                _isu_session.get,
+                f"https://isu.ifmo.ru/pls/apex/f?p=2143:1:{_isu_session.nonce}",
+            )
+            if resp.status_code == 200 and "2143" in resp.text:
+                return
+        except Exception:
+            pass
+
+    isu = IsuSession(timeout=30)
+    await asyncio.to_thread(isu.authenticate_by_password, login, password)
+    _isu_session = isu
 
 
 async def _indexer_loop() -> None:
     delay = max(1.0, settings.isu_index_delay)
     reindex_interval = 24 * 3600
-    startup_retry = 60
+    startup_retry = 120
 
     while True:
-        refresh_token = await _get_refresh_token()
-        if not refresh_token:
-            set_meta("indexer_status", "waiting_for_user")
+        login, password = _index_credentials()
+        if not login or not password:
+            set_meta("indexer_status", "waiting_credentials")
+            set_meta(
+                "last_error",
+                "Укажите ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env",
+            )
             log.info(
-                "No user with my.itmo connected yet, "
-                "ISU indexer will retry in %ds", startup_retry,
+                "ISU_INDEX_LOGIN / ISU_INDEX_PASSWORD not set, retry in %ds",
+                startup_retry,
             )
             await asyncio.sleep(startup_retry)
             continue
 
         try:
             set_meta("indexer_status", "authenticating")
-            await _ensure_session(refresh_token)
+            await _ensure_session()
             assert _isu_session is not None
 
             set_meta("indexer_status", "fetching_groups")
@@ -105,8 +158,7 @@ async def _indexer_loop() -> None:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 120)
 
-                    refresh_token = await _get_refresh_token() or refresh_token
-                    await _ensure_session(refresh_token)
+                    await _ensure_session()
                     try:
                         students = await asyncio.to_thread(
                             fetch_students_for_group, _isu_session, group_enc
@@ -131,21 +183,3 @@ async def _indexer_loop() -> None:
             log.exception("ISU indexer error")
 
         await asyncio.sleep(reindex_interval)
-
-
-async def _ensure_session(refresh_token: str) -> None:
-    global _isu_session
-    if _isu_session is not None and _isu_session.session is not None:
-        try:
-            resp = await asyncio.to_thread(
-                _isu_session.get,
-                f"https://isu.ifmo.ru/pls/apex/f?p=2143:1:{_isu_session.nonce}",
-            )
-            if resp.status_code == 200 and "2143" in resp.text:
-                return
-        except Exception:
-            pass
-
-    isu = IsuSession(timeout=30)
-    await asyncio.to_thread(isu.authenticate_by_token, refresh_token)
-    _isu_session = isu
