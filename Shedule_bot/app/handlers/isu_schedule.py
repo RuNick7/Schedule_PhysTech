@@ -449,11 +449,23 @@ def _short_potok_name(name: str) -> str:
     return s
 
 
+_STATUS_LABELS = {
+    "authenticating": "вход в ИСУ…",
+    "fetching_groups": "загрузка списка групп…",
+    "fetching_potoks": "загрузка списка потоков…",
+    "indexing_students": "индексация студентов по группам…",
+    "idle": "готово",
+    "waiting_credentials": "ожидание настроек",
+    "error": "ошибка",
+}
+
+
 def _format_index_status(progress: Dict) -> str:
     status = progress.get("indexer_status", "idle")
     g_total = progress.get("groups_total", 0)
     g_indexed = progress.get("groups_indexed", 0)
     p_total = progress.get("potoks_total", 0)
+    label = _STATUS_LABELS.get(status, status)
 
     if status == "waiting_credentials":
         return (
@@ -464,12 +476,25 @@ def _format_index_status(progress: Dict) -> str:
     if status == "idle" and g_total == 0:
         return "Индексация ещё не запускалась.\n"
 
+    # Пока не загружен список групп, цифры 0/0 не показываем — это не «прогресс»
+    if status in ("authenticating", "fetching_groups", "fetching_potoks"):
+        if g_total == 0:
+            return (
+                f"Индексатор: <b>{label}</b>\n"
+                "Счётчики появятся после загрузки списков с ИСУ.\n"
+            )
+    if status == "indexing_students" and g_total == 0:
+        return (
+            f"Индексатор: <b>{label}</b>\n"
+            "Ожидается список групп…\n"
+        )
+
     if status in ("authenticating", "fetching_groups", "fetching_potoks", "indexing_students"):
         pct = (g_indexed / g_total * 100) if g_total else 0
         return (
-            f"Индексация: {status}\n"
-            f"Группы: {g_total}, потоки: {p_total}\n"
-            f"Студенты проиндексированы: {g_indexed}/{g_total} ({pct:.0f}%)\n"
+            f"Индексатор: <b>{label}</b>\n"
+            f"Групп в списке: {g_total}, потоков: {p_total}\n"
+            f"Студенты: {g_indexed}/{g_total} групп ({pct:.0f}%)\n"
         )
 
     if status == "error":
@@ -478,6 +503,6 @@ def _format_index_status(progress: Dict) -> str:
 
     pct = (g_indexed / g_total * 100) if g_total else 0
     return (
-        f"Группы: {g_total}, потоки: {p_total}\n"
+        f"Групп в списке: {g_total}, потоков: {p_total}\n"
         f"Студенты: {g_indexed}/{g_total} групп ({pct:.0f}%)\n"
     )
