@@ -55,7 +55,8 @@ def _kb_main_menu():
     kb.button(text="🔍 Чужое расписание", callback_data="main:isu_schedule")
     kb.button(text="⚙️ Настройки", callback_data="main:settings")
     kb.button(text="📆 Google Calendar", callback_data="main:gcal")
-    kb.adjust(1, 1, 1, 1)
+    kb.button(text="💬 Поддержка", url="https://t.me/NitrateX1")
+    kb.adjust(1, 1, 1, 1, 1)
     return kb.as_markup()
 
 def kb_schedule_root():
