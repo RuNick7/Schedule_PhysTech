@@ -3,7 +3,9 @@ from __future__ import annotations
 import html as html_lib
 import logging
 import re
+import time
 import urllib.parse
+from html import unescape as html_unescape
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -13,7 +15,6 @@ from app.services.myitmo_client import (
     _CLIENT_ID,
     _PROVIDER,
     _REDIRECT_URI,
-    _extract_login_action,
     _generate_code_verifier,
     _get_code_challenge,
 )
@@ -21,6 +22,30 @@ from app.services.myitmo_client import (
 log = logging.getLogger("isu.client")
 
 _ISU_BASE = "https://isu.ifmo.ru"
+# Как в ITMOStalk: OAuth без PKCE my.itmo, сразу client_id=isu и редирект на SSO ИСУ
+_ISU_PASSWORD_AUTH_URL = (
+    "https://id.itmo.ru/auth/realms/itmo/protocol/openid-connect/auth"
+    "?response_type=code&scope=openid&client_id=isu"
+    "&redirect_uri=https://isu.ifmo.ru/api/sso/v1/public/login?apex_params=p=2143:LOGIN:"
+)
+_LOGIN_ACTION_RE = re.compile(r'"loginAction":\s*"(.+?)"', re.MULTILINE | re.DOTALL)
+# Заголовки как у ITMOStalk (httpx + браузерный профиль)
+_ISU_INDEXER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Upgrade-Insecure-Requests": "1",
+}
 # Nonce в ссылках APEX: f?p=2143:9:1234567890::...
 _NONCE_RE = re.compile(r"f\?p=2143:\d+:(\d{8,})", re.I)
 
@@ -168,57 +193,85 @@ class IsuSession:
         log.info("ISU authenticated via refresh_token, nonce=%s", nonce)
 
     def authenticate_by_password(self, username: str, password: str) -> None:
-        """Fallback: full OAuth2 PKCE with username+password."""
+        """
+        Вход по паре логин/пароль — как в ITMOStalk:
+        OAuth с client_id=isu, redirect на SSO ИСУ, POST на loginAction,
+        редиректы обрабатываются вручную (без allow_redirects на POST).
+        """
         sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (schedule-bot ISU indexer)",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-        })
+        sess.headers.update(_ISU_INDEXER_HEADERS)
+        if hasattr(sess, "trust_env"):
+            sess.trust_env = False
+        to = self._connect_read_timeouts()
 
-        code_verifier = _generate_code_verifier()
-        code_challenge = _get_code_challenge(code_verifier)
+        auth_page = sess.get(_ISU_PASSWORD_AUTH_URL, timeout=to)
+        auth_page.raise_for_status()
 
-        auth_resp = sess.get(
-            f"{_PROVIDER}/protocol/openid-connect/auth",
-            params={
-                "protocol": "oauth2",
-                "response_type": "code",
-                "client_id": _CLIENT_ID,
-                "redirect_uri": _REDIRECT_URI,
-                "scope": "openid",
-                "state": "isu-indexer",
-                "code_challenge_method": "S256",
-                "code_challenge": code_challenge,
+        m = _LOGIN_ACTION_RE.search(auth_page.text or "")
+        if not m:
+            raise IsuSessionError(
+                "Не удалось найти loginAction (Keycloak, client_id=isu / ITMOStalk)."
+            )
+        form_action = html_unescape(m.group(1))
+
+        resp = sess.post(
+            form_action,
+            data={
+                "username": username,
+                "password": password,
+                "rememberMe": "on",
+                "credentialId": "",
             },
-            timeout=self._connect_read_timeouts(),
-        )
-        auth_resp.raise_for_status()
-
-        form_action = _extract_login_action(auth_resp.text)
-        sess.post(
-            url=form_action,
-            data={"username": username, "password": password},
-            cookies=auth_resp.cookies,
-            allow_redirects=True,
-            timeout=self._connect_read_timeouts(),
+            cookies=auth_page.cookies,
+            allow_redirects=False,
+            timeout=to,
         )
 
-        isu_resp = sess.get(
-            f"{_ISU_BASE}/pls/apex/f?p=2143:1",
-            allow_redirects=True,
-            timeout=self._connect_read_timeouts(),
-        )
-        isu_resp.raise_for_status()
+        if resp.status_code != 302:
+            if resp.status_code == 200 and _looks_like_isu_login_page(resp.text or ""):
+                raise IsuSessionError(
+                    "Неверный логин или пароль для ИСУ (ISU_INDEX_LOGIN / ISU_INDEX_PASSWORD)."
+                )
+            raise IsuSessionError(
+                f"Вход в ИСУ: ожидался редирект 302, получен HTTP {resp.status_code}."
+            )
 
-        nonce = self._extract_nonce(str(isu_resp.url))
+        time.sleep(0.5)
+        cur = resp
+        hops = 0
+        while cur.status_code in (301, 302, 303, 307, 308) and hops < 30:
+            hops += 1
+            loc = cur.headers.get("Location")
+            if not loc:
+                break
+            next_url = urllib.parse.urljoin(str(cur.url), loc)
+            cur = sess.get(next_url, allow_redirects=False, timeout=to)
+        time.sleep(1.0)
+
+        if cur.status_code in (301, 302, 303, 307, 308):
+            raise IsuSessionError(
+                "Слишком много редиректов или обрыв цепочки входа в ИСУ."
+            )
+
+        nonce = self._extract_nonce(str(cur.url))
         if not nonce:
-            nonce = self._extract_nonce(isu_resp.text)
+            nonce = self._extract_nonce(cur.text or "")
+
         if not nonce:
-            raise IsuSessionError("Failed to extract ISU nonce after password auth")
+            if _looks_like_isu_login_page(cur.text or ""):
+                raise IsuSessionError(
+                    "ИСУ вернул страницу входа. Проверьте ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD."
+                )
+            raise IsuSessionError(
+                "Не удалось получить nonce ИСУ после входа (поток как в ITMOStalk)."
+            )
 
         self.session = sess
         self.nonce = nonce
-        log.info("ISU authenticated via password, nonce=%s", nonce)
+        log.info(
+            "ISU authenticated via password (ITMOStalk isu client flow), nonce=%s",
+            nonce,
+        )
 
     @staticmethod
     def _extract_nonce(text: str) -> Optional[str]:
