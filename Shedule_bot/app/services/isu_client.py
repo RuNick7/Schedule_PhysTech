@@ -7,6 +7,7 @@ import re
 import time
 import urllib.parse
 from html import unescape as html_unescape
+from urllib.parse import unquote as url_unquote
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -330,6 +331,130 @@ def fetch_potok_schedule_html(isu: IsuSession, potok_id: int) -> str:
 
 # ── HTML parsers ────────────────────────────────────────────────────────
 
+def _extract_potok_id_from_string(s: str) -> Optional[int]:
+    """Ищет ID учебного потока в фрагменте URL/onclick (в т.ч. URL-encoded)."""
+    if not s:
+        return None
+    raw = html_lib.unescape(s)
+    for text in (raw, url_unquote(raw.replace("&amp;", "&"))):
+        for pat in (
+            r"ID_POTOK:potok,(\d+)",
+            r"ID_POTOK%3Apotok%2C(\d+)",
+            r"GR_TYPE,ID_POTOK:potok,(\d+)",
+            r"SCH,SCH_POTOK_ID,SCH_TYPE:\d+,(\d+),\d+",
+            r"SCH_TYPE:\d+,(\d+),\d+",
+        ):
+            m = re.search(pat, text, re.I)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def _parse_potoks_itmostalk_dom(soup: BeautifulSoup) -> List[Tuple[int, str]]:
+    """Дерево как в ITMOStalk: span.i_dummy>div.note и соседи с href."""
+    current_tag = soup.select_one("span.i_dummy>div.note")
+    if not current_tag:
+        return []
+
+    out: List[Tuple[int, str]] = []
+    group_name = ""
+    first_inner = current_tag.find()
+    if first_inner:
+        group_name = re.sub(r"\n +", " ", first_inner.get_text()).strip()
+    else:
+        group_name = re.sub(r"\s+", " ", current_tag.get_text()).strip()
+    group_name = re.sub(r"^\[.+?\]\s*", "", group_name)
+
+    current_group: List[Tuple[str, int]] = []
+    used_group_labels: set[str] = set()
+
+    while True:
+        current_tag = current_tag.find_next_sibling()
+        if not current_tag:
+            break
+        if current_tag.name == "div":
+            if current_group:
+                gk = group_name
+                while gk in used_group_labels:
+                    gk = gk + " "
+                used_group_labels.add(gk)
+                for pname, pid in current_group:
+                    label = f"{gk} — {pname}".strip(" —")
+                    out.append((pid, label))
+                current_group = []
+            inner = current_tag.find()
+            group_name = (
+                inner.get_text() if inner else current_tag.get_text()
+            )
+            group_name = re.sub(r"\n +", " ", group_name).strip()
+            group_name = re.sub(r"^\[.+?\]\s*", "", group_name)
+        else:
+            href = current_tag.get("href")
+            if not href:
+                continue
+            potok_id = _extract_potok_id_from_string(href)
+            if potok_id is None:
+                parts = href.split(",")
+                if len(parts) >= 2:
+                    cand = parts[-2].strip()
+                    if cand.isdigit():
+                        potok_id = int(cand)
+            if potok_id is None:
+                continue
+            potok_name = re.sub(r"\s+", " ", current_tag.get_text(" ", strip=True))
+            potok_name = re.sub(r"^\[.+?\]\s*", "", potok_name)
+            current_group.append((potok_name, potok_id))
+
+    if current_group:
+        gk = group_name
+        while gk in used_group_labels:
+            gk = gk + " "
+        used_group_labels.add(gk)
+        for pname, pid in current_group:
+            label = f"{gk} — {pname}".strip(" —")
+            out.append((pid, label))
+
+    return out
+
+
+def _parse_potoks_from_all_attributes(soup: BeautifulSoup) -> List[Tuple[int, str]]:
+    """href/onclick/data-* у любых тегов — потоки часто не в <a>."""
+    out: List[Tuple[int, str]] = []
+    for tag in soup.find_all(True):
+        for attr in ("href", "onclick", "data-href", "data-url", "data-link"):
+            val = tag.get(attr)
+            if not val or not isinstance(val, str):
+                continue
+            pid = _extract_potok_id_from_string(val)
+            if pid is None:
+                continue
+            name = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            name = re.sub(r"^\[.+?\]\s*", "", name)
+            if not name:
+                name = f"Поток {pid}"
+            out.append((pid, name))
+    return out
+
+
+def _parse_potoks_raw_regex(page_html: str) -> List[Tuple[int, str]]:
+    """Последний шанс: все вхождения ID в сыром HTML (имя — placeholder)."""
+    seen: set = set()
+    out: List[Tuple[int, str]] = []
+    for pat in (
+        r"ID_POTOK:potok,(\d+)",
+        r"ID_POTOK%3Apotok%2C(\d+)",
+        r"GR_TYPE,ID_POTOK:potok,(\d+)",
+        r"SCH,SCH_POTOK_ID,SCH_TYPE:\d+,(\d+),\d+",
+    ):
+        for m in re.finditer(pat, page_html, re.I):
+            pid = int(m.group(1))
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append((pid, f"Поток {pid}"))
+    return out
+
+
 def _parse_group_or_potok_list(
     page_html: str, list_type: str = "group"
 ) -> list:
@@ -351,18 +476,26 @@ def _parse_group_or_potok_list(
                 name = m.group(1)
             results.append((m.group(1), name))
         else:
-            m = re.search(r"ID_POTOK:potok,(\d+)", href)
-            if not m:
+            pid = _extract_potok_id_from_string(href)
+            if pid is None:
                 continue
             name = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
             name = re.sub(r"^\[.+?\]\s*", "", name)
-            results.append((int(m.group(1)), name))
+            if not name:
+                name = f"Поток {pid}"
+            results.append((pid, name))
 
     if results:
         return _dedupe_group_or_potok(results)
 
     if list_type == "group":
         results = _parse_groups_mustache_spans(soup)
+    else:
+        results = _parse_potoks_itmostalk_dom(soup)
+        if not results:
+            results = _parse_potoks_from_all_attributes(soup)
+        if not results:
+            results = _parse_potoks_raw_regex(page_html)
 
     if not results and len(page_html or "") > 500:
         log.warning(
