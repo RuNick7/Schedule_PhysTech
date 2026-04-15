@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html as html_lib
+import json
 import logging
 import re
 import time
@@ -332,25 +333,73 @@ def fetch_potok_schedule_html(isu: IsuSession, potok_id: int) -> str:
 def _parse_group_or_potok_list(
     page_html: str, list_type: str = "group"
 ) -> list:
+    """
+    Список групп/потоков с ИСУ. Раньше хватало <a href>; актуальная вёрстка
+    (как в ITMOStalk) — mustache в span и href не только у <a>.
+    """
     soup = BeautifulSoup(page_html, "lxml")
-    results = []
+    results: list = []
 
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"]
-        name = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True))
-        if not name:
-            continue
-
+    for tag in soup.find_all(True, href=True):
+        href = tag.get("href") or ""
         if list_type == "group":
             m = re.search(r"GR_GR,GR_TYPE:([^,]+),group", href)
-            if m:
-                results.append((m.group(1), name))
+            if not m:
+                continue
+            name = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            if not name:
+                name = m.group(1)
+            results.append((m.group(1), name))
         else:
             m = re.search(r"ID_POTOK:potok,(\d+)", href)
-            if m:
-                results.append((int(m.group(1)), name))
+            if not m:
+                continue
+            name = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            name = re.sub(r"^\[.+?\]\s*", "", name)
+            results.append((int(m.group(1)), name))
 
-    return results
+    if results:
+        return _dedupe_group_or_potok(results)
+
+    if list_type == "group":
+        results = _parse_groups_mustache_spans(soup)
+
+    if not results and len(page_html or "") > 500:
+        log.warning(
+            "ISU list page parsed 0 %s (len=%d); markup may have changed",
+            list_type,
+            len(page_html),
+        )
+    return _dedupe_group_or_potok(results) if results else results
+
+
+def _dedupe_group_or_potok(rows: list) -> list:
+    seen: set = set()
+    out = []
+    for row in rows:
+        key = row[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _parse_groups_mustache_spans(soup: BeautifulSoup) -> List[Tuple[str, str]]:
+    """Как ITMOStalk: JSON в span[data-mustache-template=template-group-group]."""
+    out: List[Tuple[str, str]] = []
+    for span in soup.select('span[data-mustache-template="template-group-group"]'):
+        raw = span.get_text()
+        text = re.sub(r"\n\s+", " ", html_lib.unescape(raw)).strip()
+        try:
+            j = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        enc = j.get("groupEnc")
+        label = (j.get("group") or "").strip()
+        if enc:
+            out.append((str(enc), label or str(enc)))
+    return out
 
 
 def _parse_student_list(page_html: str) -> List[Tuple[int, str]]:
