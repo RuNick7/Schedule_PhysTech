@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List
+from datetime import timedelta
+from typing import Any, Dict, List
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -18,14 +19,23 @@ from app.services.isu_client import (
 )
 from app.services.isu_db import (
     get_cached_schedule,
+    get_cached_schedule_entries,
+    get_group_by_enc,
     get_index_progress,
+    get_potok_name,
+    get_potoks_by_student,
+    get_student_by_id,
     save_schedule_html,
+    save_schedule_entries,
     search_groups,
     search_potoks_by_group,
     search_students_by_fio,
 )
 from app.services.isu_indexer import get_service_isu_session
 from app.services.isu_schedule_parser import parse_schedule_html
+from app.utils.dt import now_tz
+from app.utils.format_schedule import format_day, format_week_compact_mono
+from app.utils.week_parity import week_parity_for_date
 
 log = logging.getLogger("isu.handler")
 
@@ -40,6 +50,7 @@ _DAY_ORDER = [
     "ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ",
     "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ",
 ]
+_DAY_UP = _DAY_ORDER
 
 
 class IsuSearch(StatesGroup):
@@ -90,7 +101,7 @@ def _kb_potoks_list(potoks: List[Dict]):
     for p in potoks[:20]:
         pid = p["potok_id"]
         name = _short_potok_name(p["potok_name"])
-        kb.button(text=name, callback_data=f"isu:potok:{pid}")
+        kb.button(text=name, callback_data=f"isu:potok:{pid}:all")
     kb.button(text="Новый поиск", callback_data="main:isu_schedule")
     kb.adjust(2)
     return kb.as_markup()
@@ -98,19 +109,28 @@ def _kb_potoks_list(potoks: List[Dict]):
 
 def _kb_fio_results(students: List[Dict]):
     kb = InlineKeyboardBuilder()
-    seen_groups: set = set()
     for s in students[:20]:
-        group_enc = s.get("group_enc", "")
         group_name = s.get("group_name", "")
-        if group_enc in seen_groups:
+        sid = s.get("student_id")
+        if not sid:
             continue
-        seen_groups.add(group_enc)
         label = f"{s['student_name']} ({group_name})" if group_name else s["student_name"]
         if len(label) > 48:
             label = label[:45] + "..."
-        kb.button(text=label, callback_data=f"isu:select:group:{group_enc}")
+        kb.button(text=label, callback_data=f"isu:select:student:{sid}")
     kb.button(text="Новый поиск", callback_data="main:isu_schedule")
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def _kb_schedule_periods(kind: str, entity_id: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Сегодня", callback_data=f"isu:view:{kind}:{entity_id}:today")
+    kb.button(text="Завтра", callback_data=f"isu:view:{kind}:{entity_id}:tomorrow")
+    kb.button(text="Неделя", callback_data=f"isu:view:{kind}:{entity_id}:week")
+    kb.button(text="Всё", callback_data=f"isu:view:{kind}:{entity_id}:all")
+    kb.button(text="Новый поиск", callback_data="main:isu_schedule")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -169,7 +189,7 @@ async def isu_search_group_handler(msg: Message, state: FSMContext):
         await msg.answer(
             f"Группы по запросу «{_esc(query)}» не найдены.\n"
             "Попробуйте другой запрос или дождитесь завершения индексации."
-            + _ATTRIBUTION,
+            ,
             reply_markup=_kb_back_to_isu(),
             disable_web_page_preview=True,
         )
@@ -217,7 +237,7 @@ async def isu_search_fio_handler(msg: Message, state: FSMContext):
         await msg.answer(
             f"Студенты по запросу «{_esc(query)}» не найдены.\n"
             "Возможно, индексация ещё не завершена."
-            + _ATTRIBUTION,
+            ,
             reply_markup=_kb_back_to_isu(),
             disable_web_page_preview=True,
         )
@@ -234,91 +254,99 @@ async def isu_search_fio_handler(msg: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("isu:select:group:"))
 async def isu_select_group(q: CallbackQuery):
     group_enc = q.data.split(":", 3)[-1]
-
-    from app.services.isu_db import _conn
-    with _conn() as con:
-        row = con.execute(
-            "SELECT * FROM groups_ WHERE group_enc = ?", (group_enc,)
-        ).fetchone()
-        target = dict(row) if row else None
-
-    if target is None:
-        results = search_students_by_fio("")
-        for s in results:
-            if s.get("group_enc") == group_enc:
-                target = {"group_enc": group_enc, "group_name": s.get("group_name", group_enc)}
-                break
-
-    if target is None:
-        target = {"group_enc": group_enc, "group_name": group_enc}
-
-    await _show_potoks_for_group_callback(q, target)
+    target = get_group_by_enc(group_enc) or {"group_enc": group_enc, "group_name": group_enc}
+    await _show_group_actions(q, target)
 
 
 async def _show_potoks_for_group(msg: Message, group: Dict) -> None:
+    group_enc = group["group_enc"]
     group_name = group["group_name"]
-    potoks = search_potoks_by_group(group_name)
-
+    potoks = search_potoks_by_group(group_enc)
     if not potoks:
         await msg.answer(
-            f"Потоки для группы <b>{_esc(group_name)}</b> не найдены.\n"
-            "Возможно, индексация потоков ещё не завершена."
-            + _ATTRIBUTION,
+            f"Для группы <b>{_esc(group_name)}</b> не найдены связанные потоки.\n"
+            "Скорее всего, индексация потоков ещё не завершена."
+            ,
             reply_markup=_kb_back_to_isu(),
             disable_web_page_preview=True,
         )
         return
-
-    if len(potoks) == 1:
-        await _fetch_and_show_schedule_msg(msg, potoks[0]["potok_id"], potoks[0]["potok_name"])
-        return
-
     await msg.answer(
-        f"Группа <b>{_esc(group_name)}</b> — найдено потоков: <b>{len(potoks)}</b>\n"
-        "Выберите поток для просмотра расписания:",
-        reply_markup=_kb_potoks_list(potoks),
+        f"Группа <b>{_esc(group_name)}</b>\n"
+        f"Найдено потоков: <b>{len(potoks)}</b>\n"
+        "Можно сразу посмотреть агрегированное расписание группы или открыть конкретный поток.",
+        reply_markup=_kb_schedule_periods("group", group_enc),
+        disable_web_page_preview=True,
     )
 
 
-async def _show_potoks_for_group_callback(q: CallbackQuery, group: Dict) -> None:
+async def _show_group_actions(q: CallbackQuery, group: Dict) -> None:
+    group_enc = group["group_enc"]
     group_name = group["group_name"]
-    potoks = search_potoks_by_group(group_name)
-
+    potoks = search_potoks_by_group(group_enc)
     if not potoks:
         await q.message.edit_text(
-            f"Потоки для группы <b>{_esc(group_name)}</b> не найдены.\n"
-            "Возможно, индексация потоков ещё не завершена."
-            + _ATTRIBUTION,
+            f"Для группы <b>{_esc(group_name)}</b> не найдены связанные потоки.\n"
+            "Скорее всего, индексация потоков ещё не завершена."
+            ,
             reply_markup=_kb_back_to_isu(),
             disable_web_page_preview=True,
         )
         await q.answer()
         return
 
-    if len(potoks) == 1:
-        await _fetch_and_show_schedule_cb(q, potoks[0]["potok_id"], potoks[0]["potok_name"])
-        return
-
     await q.message.edit_text(
-        f"Группа <b>{_esc(group_name)}</b> — найдено потоков: <b>{len(potoks)}</b>\n"
-        "Выберите поток для просмотра расписания:",
-        reply_markup=_kb_potoks_list(potoks),
+        f"Группа <b>{_esc(group_name)}</b>\n"
+        f"Найдено потоков: <b>{len(potoks)}</b>\n"
+        "Можно сразу посмотреть агрегированное расписание группы или открыть конкретный поток.",
+        reply_markup=_kb_schedule_periods("group", group_enc),
+        disable_web_page_preview=True,
     )
     await q.answer()
 
 
-# ── select potok → show schedule ────────────────────────────────────────
+# ── select student / potok / period ─────────────────────────────────────
+
+@router.callback_query(F.data.startswith("isu:select:student:"))
+async def isu_select_student(q: CallbackQuery):
+    student_id = int(q.data.split(":")[-1])
+    potoks = get_potoks_by_student(student_id)
+    if not potoks:
+        await q.message.edit_text(
+            "Для этого студента пока не найдены потоки.\n"
+            "Скорее всего, индексация потоков ещё не завершена."
+            ,
+            reply_markup=_kb_back_to_isu(),
+            disable_web_page_preview=True,
+        )
+        await q.answer()
+        return
+
+    student = get_student_by_id(student_id)
+    student_label = student["student_name"] if student else str(student_id)
+    if student and student.get("group_name"):
+        student_label = f"{student_label} ({student['group_name']})"
+
+    await q.message.edit_text(
+        f"Студент <b>{_esc(student_label)}</b>\n"
+        f"Найдено потоков: <b>{len(potoks)}</b>\n"
+        "Выберите период для общего расписания по всем потокам.",
+        reply_markup=_kb_schedule_periods("student", str(student_id)),
+        disable_web_page_preview=True,
+    )
+    await q.answer()
+
 
 @router.callback_query(F.data.startswith("isu:potok:"))
 async def isu_select_potok(q: CallbackQuery):
-    potok_id = int(q.data.split(":")[-1])
-    from app.services.isu_db import _conn
-    with _conn() as con:
-        row = con.execute(
-            "SELECT potok_name FROM potoks WHERE potok_id = ?", (potok_id,)
-        ).fetchone()
-    potok_name = row["potok_name"] if row else str(potok_id)
-    await _fetch_and_show_schedule_cb(q, potok_id, potok_name)
+    _, _, pid_s, period = q.data.split(":", 3)
+    await _show_period_schedule(q, "potok", pid_s, period)
+
+
+@router.callback_query(F.data.startswith("isu:view:"))
+async def isu_view_schedule(q: CallbackQuery):
+    _, _, kind, entity_id, period = q.data.split(":", 4)
+    await _show_period_schedule(q, kind, entity_id, period)
 
 
 # ── schedule fetching and formatting ────────────────────────────────────
@@ -336,67 +364,197 @@ async def _get_isu_session_for_user(_telegram_id: int) -> IsuSession:
     )
 
 
-async def _fetch_and_show_schedule_cb(
-    q: CallbackQuery, potok_id: int, potok_name: str
+async def _show_period_schedule(
+    q: CallbackQuery, kind: str, entity_id: str, period: str
 ) -> None:
     await q.answer("Загружаю расписание...")
-    text = await _get_schedule_text(q.from_user.id, potok_id, potok_name)
+    text = await _render_schedule_text(q.from_user.id, kind, entity_id, period)
+    reply = _kb_schedule_periods(kind, entity_id)
     try:
         await q.message.edit_text(
-            text, reply_markup=_kb_back_to_isu(), disable_web_page_preview=True
+            text, reply_markup=reply, disable_web_page_preview=True
         )
     except Exception:
         await q.message.answer(
-            text, reply_markup=_kb_back_to_isu(), disable_web_page_preview=True
+            text, reply_markup=reply, disable_web_page_preview=True
         )
 
 
-async def _fetch_and_show_schedule_msg(
-    msg: Message, potok_id: int, potok_name: str
-) -> None:
-    text = await _get_schedule_text(msg.from_user.id, potok_id, potok_name)
-    await msg.answer(
-        text, reply_markup=_kb_back_to_isu(), disable_web_page_preview=True
-    )
+async def _render_schedule_text(
+    telegram_id: int, kind: str, entity_id: str, period: str
+) -> str:
+    lessons, label = await _resolve_lessons_for_entity(telegram_id, kind, entity_id)
+    if not lessons:
+        return f"Расписание для <b>{_esc(label)}</b> не найдено или пока пусто."
+
+    period = (period or "all").lower()
+    if period == "all":
+        return _format_all_lessons(label, lessons)
+
+    tz = None
+    try:
+        from app.services.db import get_user as _get_user
+        user = _get_user(telegram_id) or {}
+        tz = user.get("timezone")
+    except Exception:
+        tz = None
+    now = now_tz(tz)
+
+    if period in {"today", "tomorrow"}:
+        target = now + timedelta(days=1 if period == "tomorrow" else 0)
+        parity = week_parity_for_date(target, tz)
+        day_upper = _DAY_UP[target.weekday()]
+        day_lessons = _filter_isu_day_lessons(lessons, day_upper, parity)
+        return _adapt_day_format(label, day_upper, parity, day_lessons)
+
+    parity = week_parity_for_date(None, tz)
+    week_lessons = _filter_isu_week_lessons(lessons, parity)
+    return _adapt_week_format(label, parity, week_lessons)
 
 
-async def _get_schedule_text(telegram_id: int, potok_id: int, potok_name: str) -> str:
+async def _resolve_lessons_for_entity(
+    telegram_id: int, kind: str, entity_id: str
+) -> tuple[List[Dict[str, Any]], str]:
+    if kind == "potok":
+        potok_id = int(entity_id)
+        potok_name = get_potok_name(potok_id) or str(potok_id)
+        lessons = await _get_potok_lessons(telegram_id, potok_id)
+        return lessons, potok_name
+
+    if kind == "student":
+        student_id = int(entity_id)
+        student = get_student_by_id(student_id)
+        label = student["student_name"] if student else str(student_id)
+        potoks = get_potoks_by_student(student_id)
+        lessons = await _get_many_potok_lessons(
+            telegram_id, potoks, include_source=len(potoks) > 1
+        )
+        return lessons, label
+
+    if kind == "group":
+        group = get_group_by_enc(entity_id) or {"group_name": entity_id}
+        potoks = search_potoks_by_group(entity_id)
+        lessons = await _get_many_potok_lessons(
+            telegram_id, potoks, include_source=len(potoks) > 1
+        )
+        return lessons, group["group_name"]
+
+    return [], entity_id
+
+
+async def _get_potok_lessons(telegram_id: int, potok_id: int) -> List[Dict[str, Any]]:
+    cached = get_cached_schedule_entries(potok_id)
+    if cached:
+        return cached
+
     html_content = get_cached_schedule(potok_id)
     if not html_content:
         try:
             isu = await _get_isu_session_for_user(telegram_id)
         except IsuSessionError as e:
-            return f"{_esc(str(e))}" + _ATTRIBUTION
-
+            log.warning("ISU schedule fetch unavailable for potok %d: %s", potok_id, e)
+            return []
         try:
-            html_content = await asyncio.to_thread(
-                fetch_potok_schedule_html, isu, potok_id
-            )
+            html_content = await asyncio.to_thread(fetch_potok_schedule_html, isu, potok_id)
             save_schedule_html(potok_id, html_content)
-        except IsuSessionError as e:
-            return f"Ошибка ISU-сессии: {_esc(str(e))}" + _ATTRIBUTION
-        except Exception as e:
+        except Exception:
             log.exception("Failed to fetch schedule for potok %d", potok_id)
-            return f"Ошибка загрузки расписания: {_esc(str(e))}" + _ATTRIBUTION
+            return []
 
     lessons = parse_schedule_html(html_content)
-    if not lessons:
-        return (
-            f"Расписание для потока <b>{_esc(potok_name)}</b> не найдено или пусто."
-            + _ATTRIBUTION
-        )
-
-    return _format_potok_schedule(potok_name, lessons)
+    save_schedule_entries(potok_id, lessons)
+    return lessons
 
 
-def _format_potok_schedule(potok_name: str, lessons: List[Dict]) -> str:
-    header = f"📆 <b>{_esc(potok_name)}</b>"
+async def _get_many_potok_lessons(
+    telegram_id: int,
+    potoks: List[Dict[str, Any]],
+    include_source: bool = False,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for potok in potoks:
+        pid = int(potok["potok_id"])
+        pname = potok.get("potok_name") or str(pid)
+        lessons = await _get_potok_lessons(telegram_id, pid)
+        for item in lessons:
+            clone = dict(item)
+            clone["potok_name"] = pname
+            if include_source:
+                subj = clone.get("subject") or ""
+                clone["subject"] = f"{subj} [{pname}]"
+            out.append(clone)
+    return out
+
+
+def _adapt_day_format(label: str, day_upper: str, parity: str, lessons: List[Dict[str, Any]]) -> str:
+    formatted = format_day(label, day_upper, parity, [_to_common_lesson(it) for it in lessons])
+    return _retitle_schedule_header(formatted)
+
+
+def _adapt_week_format(label: str, parity: str, lessons: List[Dict[str, Any]]) -> str:
+    formatted = format_week_compact_mono(label, parity, [_to_common_lesson(it) for it in lessons])
+    return _retitle_schedule_header(formatted)
+
+
+def _filter_isu_day_lessons(
+    lessons: List[Dict[str, Any]], day_upper: str, parity: str
+) -> List[Dict[str, Any]]:
+    np = _norm_parity(parity)
+    return [
+        it for it in lessons
+        if str(it.get("day") or "").strip().upper() == day_upper
+        and _isu_lesson_matches_parity(it, np)
+    ]
+
+
+def _filter_isu_week_lessons(
+    lessons: List[Dict[str, Any]], parity: str
+) -> List[Dict[str, Any]]:
+    np = _norm_parity(parity)
+    return [it for it in lessons if _isu_lesson_matches_parity(it, np)]
+
+
+def _isu_lesson_matches_parity(lesson: Dict[str, Any], parity: str) -> bool:
+    lp = _norm_parity(lesson.get("parity") or "")
+    if not lp:
+        return True
+    return lp == parity
+
+
+def _to_common_lesson(lesson: Dict[str, Any]) -> Dict[str, str]:
+    subject = str(lesson.get("subject") or "").strip()
+    lesson_type = str(lesson.get("lesson_type") or "").strip()
+    teacher = str(lesson.get("teacher") or "").strip()
+    room = str(lesson.get("room") or "").strip()
+
+    lecture = subject
+    if lesson_type:
+        lecture = f"{lecture} ({lesson_type})"
+    if teacher:
+        lecture = f"{lecture} {teacher}"
+
+    text = lecture
+    if room:
+        text = f"{lecture} — {room}"
+
+    parity = _norm_parity(lesson.get("parity") or "")
+    return {
+        "day": str(lesson.get("day") or "").strip().upper(),
+        "time": str(lesson.get("time") or "").strip(),
+        "text": text,
+        "parity": parity,
+        "special": False,
+        "room_is_zoom": False,
+        "room_link": "",
+    }
+
+
+def _format_all_lessons(label: str, lessons: List[Dict[str, Any]]) -> str:
+    header = f"📆 <b>{_esc(label)}</b>"
     sep = "—" * 40
-
-    by_day: Dict[str, List[Dict]] = {}
+    by_day: Dict[str, List[Dict[str, Any]]] = {}
     for les in lessons:
-        d = les["day"]
-        by_day.setdefault(d, []).append(les)
+        by_day.setdefault(str(les.get("day") or "").strip().upper(), []).append(les)
 
     lines = [header, sep]
     for day in _DAY_ORDER:
@@ -404,42 +562,47 @@ def _format_potok_schedule(potok_name: str, lessons: List[Dict]) -> str:
         if not day_lessons:
             continue
         lines.append(f"\n📌 <b>{day.title()}</b>")
-        day_lessons.sort(key=lambda x: x.get("time", ""))
-        for les in day_lessons:
-            time_s = les.get("time", "")
-            subj = les.get("subject", "")
-            room = les.get("room", "")
-            teacher = les.get("teacher", "")
-            ltype = les.get("lesson_type", "")
-            parity = les.get("parity", "")
-
-            parts = [f"⏰ {_esc(time_s)}"]
-            subj_line = f"📚 {_esc(subj)}"
-            if ltype:
-                subj_line += f" ({_esc(ltype)})"
-            if parity:
-                subj_line += f" [{_esc(parity)}]"
-            parts.append(subj_line)
-            if teacher:
-                parts.append(f"👤 {_esc(teacher)}")
-            if room:
-                parts.append(f"📍 {_esc(room)}")
-
+        for les in sorted(day_lessons, key=lambda x: x.get("time", "")):
+            parts = [f"⏰ {_esc(str(les.get('time') or ''))}"]
+            subj = str(les.get("subject") or "")
+            if les.get("lesson_type"):
+                subj += f" ({les['lesson_type']})"
+            if les.get("parity"):
+                subj += f" [{str(les.get('parity'))}]"
+            parts.append(f"📚 {_esc(subj)}")
+            if les.get("teacher"):
+                parts.append(f"👤 {_esc(str(les.get('teacher')))}")
+            if les.get("room"):
+                parts.append(f"📍 {_esc(str(les.get('room')))}")
             lines.append("\n".join(parts))
             lines.append(sep)
 
-    result = "\n".join(lines) + _ATTRIBUTION
-
+    result = "\n".join(lines).rstrip(sep + "\n")
     if len(result) > 4000:
-        result = result[:3950] + "\n...(обрезано)" + _ATTRIBUTION
-
+        result = result[:3950] + "\n...(обрезано)"
     return result
+
+
+def _retitle_schedule_header(text: str) -> str:
+    lines = text.splitlines()
+    if lines:
+        lines[0] = lines[0].replace("Группа ", "", 1)
+    return "\n".join(lines)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _norm_parity(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    if "неч" in text:
+        return "нечёт"
+    if "чет" in text:
+        return "чёт"
+    return text
 
 
 def _short_potok_name(name: str) -> str:
@@ -453,6 +616,7 @@ _STATUS_LABELS = {
     "authenticating": "вход в ИСУ…",
     "fetching_groups": "загрузка списка групп…",
     "fetching_potoks": "загрузка списка потоков…",
+    "indexing_potoks": "индексация участников потоков…",
     "indexing_students": "индексация студентов по группам…",
     "idle": "готово",
     "waiting_credentials": "ожидание настроек",
@@ -465,6 +629,7 @@ def _format_index_status(progress: Dict) -> str:
     g_total = progress.get("groups_total", 0)
     g_indexed = progress.get("groups_indexed", 0)
     p_total = progress.get("potoks_total", 0)
+    p_indexed = progress.get("potoks_indexed", 0)
     label = _STATUS_LABELS.get(status, status)
 
     if status == "waiting_credentials":
@@ -477,7 +642,7 @@ def _format_index_status(progress: Dict) -> str:
         return "Индексация ещё не запускалась.\n"
 
     # Пока не загружен список групп, цифры 0/0 не показываем — это не «прогресс»
-    if status in ("authenticating", "fetching_groups", "fetching_potoks"):
+    if status in ("authenticating", "fetching_groups", "fetching_potoks", "indexing_potoks"):
         if g_total == 0:
             return (
                 f"Индексатор: <b>{label}</b>\n"
@@ -489,11 +654,13 @@ def _format_index_status(progress: Dict) -> str:
             "Ожидается список групп…\n"
         )
 
-    if status in ("authenticating", "fetching_groups", "fetching_potoks", "indexing_students"):
+    if status in ("authenticating", "fetching_groups", "fetching_potoks", "indexing_potoks", "indexing_students"):
         pct = (g_indexed / g_total * 100) if g_total else 0
+        potok_pct = (p_indexed / p_total * 100) if p_total else 0
         return (
             f"Индексатор: <b>{label}</b>\n"
             f"Групп в списке: {g_total}, потоков: {p_total}\n"
+            f"Потоки: {p_indexed}/{p_total} ({potok_pct:.0f}%)\n"
             f"Студенты: {g_indexed}/{g_total} групп ({pct:.0f}%)\n"
         )
 

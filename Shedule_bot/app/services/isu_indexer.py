@@ -14,10 +14,13 @@ from app.services.isu_client import (
     fetch_group_list,
     fetch_potok_list,
     fetch_students_for_group,
+    fetch_students_for_potok,
 )
 from app.services.isu_db import (
+    clear_potok_students,
     save_groups,
     save_potoks,
+    save_potok_students,
     save_students_for_group,
     set_meta,
 )
@@ -201,6 +204,47 @@ async def _indexer_loop() -> None:
             save_potoks(potoks)
             log.info("Indexed %d potoks", len(potoks))
             await asyncio.sleep(delay)
+
+            set_meta("indexer_status", "indexing_potoks")
+            await asyncio.to_thread(clear_potok_students)
+            backoff = delay
+            for idx, (potok_id, potok_name) in enumerate(potoks, 1):
+                try:
+                    await _isu_throttle_before_request()
+                    students = await asyncio.to_thread(
+                        fetch_students_for_potok, _isu_session, potok_id
+                    )
+                    await asyncio.to_thread(
+                        save_potok_students, potok_id, potok_name, students
+                    )
+                    backoff = delay
+                    if idx % 50 == 0:
+                        log.info(
+                            "Potok member index progress: %d/%d potoks",
+                            idx,
+                            len(potoks),
+                        )
+                except (ConnectionError, OSError, requests.exceptions.Timeout) as e:
+                    log.warning(
+                        "Network/rate issue at potok %d/%d (%s), backing off %.0fs: %s",
+                        idx, len(potoks), potok_name, backoff, e,
+                    )
+                    set_meta("last_error", f"potok {idx}: {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 120)
+                    await _ensure_session()
+                    try:
+                        await _isu_throttle_before_request()
+                        students = await asyncio.to_thread(
+                            fetch_students_for_potok, _isu_session, potok_id
+                        )
+                        await asyncio.to_thread(
+                            save_potok_students, potok_id, potok_name, students
+                        )
+                    except Exception:
+                        log.warning("Retry failed for potok %s, skipping", potok_name)
+
+                await asyncio.sleep(delay)
 
             set_meta("indexer_status", "indexing_students")
             backoff = delay

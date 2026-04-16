@@ -318,6 +318,19 @@ def fetch_students_for_group(
     return _parse_student_list(resp.text)
 
 
+def fetch_students_for_potok(
+    isu: IsuSession, potok_id: int
+) -> List[Tuple[int, str]]:
+    """Returns list of (student_id, student_name) for a potok."""
+    url = (
+        f"{_ISU_BASE}/pls/apex/f?p=2143:GR:{isu.nonce}"
+        f"::NO::GR_TYPE,ID_POTOK:potok,{potok_id}"
+    )
+    resp = isu.get(url)
+    resp.raise_for_status()
+    return _parse_student_list(resp.text)
+
+
 def fetch_potok_schedule_html(isu: IsuSession, potok_id: int) -> str:
     """Fetches the raw schedule page HTML for a potok."""
     url = (
