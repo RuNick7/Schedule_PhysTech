@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as _time
 import traceback
 from typing import Optional
 
@@ -31,8 +32,10 @@ _isu_session: Optional[IsuSession] = None
 _indexer_task: Optional[asyncio.Task] = None
 _isu_throttle_seq: int = 0
 _last_service_session_error: Optional[str] = None
+_last_service_session_fail_ts: float = 0.0
 
 _LOGIN_ATTEMPTS = 5
+_SERVICE_SESSION_COOLDOWN_SEC: float = 120.0
 
 
 def get_shared_isu_session() -> Optional[IsuSession]:
@@ -112,12 +115,19 @@ async def _login_isu_with_retries() -> IsuSession:
 async def get_service_isu_session() -> Optional[IsuSession]:
     """
     Сессия ИСУ для загрузки расписаний: общая с индексатором или новая по ISU_INDEX_*.
+    Circuit breaker: если недавно был провал — не ретраим сразу для каждого потока.
     """
-    global _isu_session, _last_service_session_error
+    global _isu_session, _last_service_session_error, _last_service_session_fail_ts
     login, password = _index_credentials()
     if not login or not password:
         _last_service_session_error = None
         return None
+
+    # Circuit breaker: если в течение cooldown после последнего провала — не ретраим
+    if _last_service_session_fail_ts:
+        elapsed = _time.monotonic() - _last_service_session_fail_ts
+        if elapsed < _SERVICE_SESSION_COOLDOWN_SEC:
+            return None
 
     if _isu_session is not None and _isu_session.session is not None:
         try:
@@ -127,6 +137,7 @@ async def get_service_isu_session() -> Optional[IsuSession]:
             )
             if resp.status_code == 200 and "2143" in resp.text:
                 _last_service_session_error = None
+                _last_service_session_fail_ts = 0.0
                 return _isu_session
         except Exception:
             pass
@@ -135,13 +146,16 @@ async def get_service_isu_session() -> Optional[IsuSession]:
         isu = await _login_isu_with_retries()
         _isu_session = isu
         _last_service_session_error = None
+        _last_service_session_fail_ts = 0.0
         return isu
     except IsuSessionError as e:
         _last_service_session_error = str(e)
+        _last_service_session_fail_ts = _time.monotonic()
         log.warning("get_service_isu_session: %s", e)
         return None
     except Exception as e:
         _last_service_session_error = str(e)
+        _last_service_session_fail_ts = _time.monotonic()
         log.warning("get_service_isu_session: auth failed: %s", e)
         return None
 
@@ -153,7 +167,7 @@ def start_isu_indexer() -> None:
 
 
 async def _ensure_session() -> None:
-    global _isu_session
+    global _isu_session, _last_service_session_error, _last_service_session_fail_ts
     login, password = _index_credentials()
     if not login or not password:
         raise IsuSessionError(
@@ -171,7 +185,14 @@ async def _ensure_session() -> None:
         except Exception:
             pass
 
-    _isu_session = await _login_isu_with_retries()
+    try:
+        _isu_session = await _login_isu_with_retries()
+        _last_service_session_error = None
+        _last_service_session_fail_ts = 0.0
+    except IsuSessionError as e:
+        _last_service_session_error = str(e)
+        _last_service_session_fail_ts = _time.monotonic()
+        raise
 
 
 async def _indexer_loop() -> None:

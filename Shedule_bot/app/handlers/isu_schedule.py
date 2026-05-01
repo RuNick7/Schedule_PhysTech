@@ -483,24 +483,25 @@ async def _get_potok_lessons(
     telegram_id: int, potok_id: int
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     max_age = max(60, int(settings.isu_schedule_cache_max_age_sec))
+
+    # Свежий кеш — мгновенный ответ, без обращения к ИСУ
     cached = get_cached_schedule_entries(potok_id, max_age_sec=max_age)
     if cached:
         return cached, None
 
+    # Устаревший кеш — вернуть сразу, обновить в фоне
+    stale = get_stale_schedule_entries(potok_id)
+    if stale:
+        asyncio.create_task(_refresh_potok_background(telegram_id, potok_id))
+        return stale, None
+
+    # Кеша нет совсем — ждём ИСУ (неизбежно при первом запросе)
     html_content = get_cached_schedule(potok_id, max_age_sec=max_age)
     if not html_content:
         try:
             isu = await _get_isu_session_for_user(telegram_id)
         except IsuSessionError as e:
-            err = str(e)
-            log.warning("ISU schedule fetch unavailable for potok %d: %s", potok_id, e)
-            stale = get_stale_schedule_entries(potok_id)
-            if stale:
-                return stale, (
-                    "Показано сохранённое расписание. ИСУ сейчас недоступен: "
-                    f"{_short_fetch_err(err)}"
-                )
-            return [], err
+            return [], str(e)
         try:
             html_content = await asyncio.to_thread(
                 fetch_potok_schedule_html, isu, potok_id
@@ -508,18 +509,24 @@ async def _get_potok_lessons(
             save_schedule_html(potok_id, html_content)
         except Exception as e:
             log.exception("Failed to fetch schedule for potok %d", potok_id)
-            err = str(e)
-            stale = get_stale_schedule_entries(potok_id)
-            if stale:
-                return stale, (
-                    "Показано сохранённое расписание. Ошибка обновления с ИСУ: "
-                    f"{_short_fetch_err(err)}"
-                )
-            return [], err
+            return [], str(e)
 
     lessons = parse_schedule_html(html_content)
     save_schedule_entries(potok_id, lessons)
     return lessons, None
+
+
+async def _refresh_potok_background(telegram_id: int, potok_id: int) -> None:
+    """Фоновое обновление кеша потока без блокировки ответа пользователю."""
+    try:
+        isu = await _get_isu_session_for_user(telegram_id)
+        html_content = await asyncio.to_thread(fetch_potok_schedule_html, isu, potok_id)
+        save_schedule_html(potok_id, html_content)
+        lessons = parse_schedule_html(html_content)
+        save_schedule_entries(potok_id, lessons)
+        log.debug("background refresh done for potok=%d", potok_id)
+    except Exception:
+        pass  # тихо — пользователь уже получил устаревшие данные
 
 
 async def _get_many_potok_lessons(
