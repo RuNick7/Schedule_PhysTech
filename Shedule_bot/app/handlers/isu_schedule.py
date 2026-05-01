@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from app.config import settings
 from app.services.db import get_user
 from app.services.isu_client import (
     IsuSession,
@@ -24,6 +25,7 @@ from app.services.isu_db import (
     get_index_progress,
     get_potok_name,
     get_potoks_by_student,
+    get_stale_schedule_entries,
     get_student_by_id,
     save_schedule_html,
     save_schedule_entries,
@@ -31,7 +33,10 @@ from app.services.isu_db import (
     search_potoks_by_group,
     search_students_by_fio,
 )
-from app.services.isu_indexer import get_service_isu_session
+from app.services.isu_indexer import (
+    get_last_service_isu_error,
+    get_service_isu_session,
+)
 from app.services.isu_schedule_parser import parse_schedule_html
 from app.utils.dt import now_tz
 from app.utils.format_schedule import format_day, format_week_compact_mono
@@ -356,12 +361,17 @@ async def _get_isu_session_for_user(_telegram_id: int) -> IsuSession:
     Загрузка расписаний с ИСУ — только через сервисный аккаунт (ISU_INDEX_* в .env).
     Доступ к кнопке у пользователя всё равно только при подключённом my.itmo.
     """
+    login = (settings.isu_index_login or "").strip()
+    password = (settings.isu_index_password or "").strip()
+    if not login or not password:
+        raise IsuSessionError(
+            "Сервер не настроен: укажите ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env."
+        )
     isu = await get_service_isu_session()
     if isu:
         return isu
-    raise IsuSessionError(
-        "Сервер не настроен: укажите ISU_INDEX_LOGIN и ISU_INDEX_PASSWORD в .env."
-    )
+    detail = get_last_service_isu_error() or "сайт ИСУ не отвечает или таймаут"
+    raise IsuSessionError(detail)
 
 
 async def _show_period_schedule(
@@ -374,26 +384,46 @@ async def _show_period_schedule(
         await q.message.edit_text(
             text, reply_markup=reply, disable_web_page_preview=True
         )
-    except Exception:
-        await q.message.answer(
-            text, reply_markup=reply, disable_web_page_preview=True
-        )
+    except Exception as e:
+        log.warning("schedule edit_text failed: %s", e)
+        try:
+            await q.message.answer(
+                text, reply_markup=reply, disable_web_page_preview=True
+            )
+        except Exception as e2:
+            log.exception("schedule answer fallback failed: %s", e2)
 
 
 async def _render_schedule_text(
     telegram_id: int, kind: str, entity_id: str, period: str
 ) -> str:
-    lessons, label = await _resolve_lessons_for_entity(telegram_id, kind, entity_id)
+    lessons, label, warn = await _resolve_lessons_for_entity(
+        telegram_id, kind, entity_id
+    )
+    prefix = ""
+    if warn:
+        prefix = f"<i>{_esc(warn)}</i>\n\n"
+
     if not lessons:
-        return f"Расписание для <b>{_esc(label)}</b> не найдено или пока пусто."
+        if warn:
+            return (
+                prefix
+                + f"Расписание для <b>{_esc(label)}</b> не загрузилось с ИСУ и "
+                "нет сохранённой копии в базе."
+            )
+        return (
+            prefix
+            + f"Расписание для <b>{_esc(label)}</b> не найдено или пока пусто."
+        )
 
     period = (period or "all").lower()
     if period == "all":
-        return _format_all_lessons(label, lessons)
+        return prefix + _format_all_lessons(label, lessons)
 
     tz = None
     try:
         from app.services.db import get_user as _get_user
+
         user = _get_user(telegram_id) or {}
         tz = user.get("timezone")
     except Exception:
@@ -405,77 +435,106 @@ async def _render_schedule_text(
         parity = week_parity_for_date(target, tz)
         day_upper = _DAY_UP[target.weekday()]
         day_lessons = _filter_isu_day_lessons(lessons, day_upper, parity)
-        return _adapt_day_format(label, day_upper, parity, day_lessons)
+        return prefix + _adapt_day_format(label, day_upper, parity, day_lessons)
 
     parity = week_parity_for_date(None, tz)
     week_lessons = _filter_isu_week_lessons(lessons, parity)
-    return _adapt_week_format(label, parity, week_lessons)
+    return prefix + _adapt_week_format(label, parity, week_lessons)
 
 
 async def _resolve_lessons_for_entity(
     telegram_id: int, kind: str, entity_id: str
-) -> tuple[List[Dict[str, Any]], str]:
+) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
     if kind == "potok":
         potok_id = int(entity_id)
         potok_name = get_potok_name(potok_id) or str(potok_id)
-        lessons = await _get_potok_lessons(telegram_id, potok_id)
-        return lessons, potok_name
+        lessons, warn = await _get_potok_lessons(telegram_id, potok_id)
+        return lessons, potok_name, warn
 
     if kind == "student":
         student_id = int(entity_id)
         student = get_student_by_id(student_id)
         label = student["student_name"] if student else str(student_id)
         potoks = get_potoks_by_student(student_id)
-        lessons = await _get_many_potok_lessons(
+        lessons, warn = await _get_many_potok_lessons(
             telegram_id, potoks, include_source=len(potoks) > 1
         )
-        return lessons, label
+        return lessons, label, warn
 
     if kind == "group":
         group = get_group_by_enc(entity_id) or {"group_name": entity_id}
         potoks = search_potoks_by_group(entity_id)
-        lessons = await _get_many_potok_lessons(
+        lessons, warn = await _get_many_potok_lessons(
             telegram_id, potoks, include_source=len(potoks) > 1
         )
-        return lessons, group["group_name"]
+        return lessons, group["group_name"], warn
 
-    return [], entity_id
+    return [], entity_id, None
 
 
-async def _get_potok_lessons(telegram_id: int, potok_id: int) -> List[Dict[str, Any]]:
-    cached = get_cached_schedule_entries(potok_id)
+def _short_fetch_err(msg: str, limit: int = 220) -> str:
+    s = (msg or "").strip().replace("\n", " ")
+    if len(s) > limit:
+        return s[: limit - 1] + "…"
+    return s
+
+
+async def _get_potok_lessons(
+    telegram_id: int, potok_id: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    max_age = max(60, int(settings.isu_schedule_cache_max_age_sec))
+    cached = get_cached_schedule_entries(potok_id, max_age_sec=max_age)
     if cached:
-        return cached
+        return cached, None
 
-    html_content = get_cached_schedule(potok_id)
+    html_content = get_cached_schedule(potok_id, max_age_sec=max_age)
     if not html_content:
         try:
             isu = await _get_isu_session_for_user(telegram_id)
         except IsuSessionError as e:
+            err = str(e)
             log.warning("ISU schedule fetch unavailable for potok %d: %s", potok_id, e)
-            return []
+            stale = get_stale_schedule_entries(potok_id)
+            if stale:
+                return stale, (
+                    "Показано сохранённое расписание. ИСУ сейчас недоступен: "
+                    f"{_short_fetch_err(err)}"
+                )
+            return [], err
         try:
-            html_content = await asyncio.to_thread(fetch_potok_schedule_html, isu, potok_id)
+            html_content = await asyncio.to_thread(
+                fetch_potok_schedule_html, isu, potok_id
+            )
             save_schedule_html(potok_id, html_content)
-        except Exception:
+        except Exception as e:
             log.exception("Failed to fetch schedule for potok %d", potok_id)
-            return []
+            err = str(e)
+            stale = get_stale_schedule_entries(potok_id)
+            if stale:
+                return stale, (
+                    "Показано сохранённое расписание. Ошибка обновления с ИСУ: "
+                    f"{_short_fetch_err(err)}"
+                )
+            return [], err
 
     lessons = parse_schedule_html(html_content)
     save_schedule_entries(potok_id, lessons)
-    return lessons
+    return lessons, None
 
 
 async def _get_many_potok_lessons(
     telegram_id: int,
     potoks: List[Dict[str, Any]],
     include_source: bool = False,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     out: List[Dict[str, Any]] = []
+    first_warn: Optional[str] = None
     for potok in potoks:
         pid = int(potok["potok_id"])
         pname = potok.get("potok_name") or str(pid)
-        lessons = await _get_potok_lessons(telegram_id, pid)
+        lessons, warn = await _get_potok_lessons(telegram_id, pid)
+        if warn and first_warn is None:
+            first_warn = warn
         for item in lessons:
             clone = dict(item)
             clone["potok_name"] = pname
@@ -483,7 +542,9 @@ async def _get_many_potok_lessons(
                 subj = clone.get("subject") or ""
                 clone["subject"] = f"{subj} [{pname}]"
             out.append(clone)
-    return out
+    if out:
+        return out, first_warn
+    return [], first_warn
 
 
 def _adapt_day_format(label: str, day_upper: str, parity: str, lessons: List[Dict[str, Any]]) -> str:
@@ -666,7 +727,14 @@ def _format_index_status(progress: Dict) -> str:
 
     if status == "error":
         err = progress.get("last_error", "")
-        return f"Индексатор: ошибка ({_esc(err[:100])})\n"
+        detail = _esc(err[:120]) if err else "неизвестная ошибка"
+        return (
+            f"Индексатор: <b>ошибка при последнем запуске</b>\n"
+            f"({detail})\n"
+            "Счётчики ниже — из кэша БД (последний успешный прогон). "
+            "Обновить их сможет только следующий успешный обход. "
+            "Просмотр расписания онлайн тоже требует доступа к ИСУ.\n"
+        )
 
     pct = (g_indexed / g_total * 100) if g_total else 0
     return (

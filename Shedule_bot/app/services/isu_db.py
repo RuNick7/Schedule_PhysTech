@@ -340,7 +340,16 @@ def save_schedule_entries(potok_id: int, lessons: List[Dict[str, Any]]) -> None:
             )
 
 
-def get_cached_schedule(potok_id: int, max_age_sec: int = 3600) -> Optional[str]:
+def _schedule_cache_max_age(default_sec: Optional[int] = None) -> int:
+    if default_sec is not None:
+        return max(60, int(default_sec))
+    return max(60, int(settings.isu_schedule_cache_max_age_sec))
+
+
+def get_cached_schedule(
+    potok_id: int, max_age_sec: Optional[int] = None
+) -> Optional[str]:
+    max_age_sec = _schedule_cache_max_age(max_age_sec)
     with _conn() as con:
         row = con.execute(
             "SELECT html, fetched_at FROM schedule_cache WHERE potok_id = ?",
@@ -359,8 +368,9 @@ def get_cached_schedule(potok_id: int, max_age_sec: int = 3600) -> Optional[str]
 
 
 def get_cached_schedule_entries(
-    potok_id: int, max_age_sec: int = 3600
+    potok_id: int, max_age_sec: Optional[int] = None
 ) -> List[Dict[str, Any]]:
+    max_age_sec = _schedule_cache_max_age(max_age_sec)
     with _conn() as con:
         row = con.execute(
             "SELECT fetched_at FROM schedule_cache WHERE potok_id = ?",
@@ -376,6 +386,21 @@ def get_cached_schedule_entries(
         except Exception:
             return []
 
+        rows = con.execute(
+            """
+            SELECT day, time, subject, room, teacher, lesson_type, parity
+            FROM schedule_entries
+            WHERE potok_id = ?
+            ORDER BY day, time, subject
+            """,
+            (potok_id,),
+        )
+        return [dict(r) for r in rows]
+
+
+def get_stale_schedule_entries(potok_id: int) -> List[Dict[str, Any]]:
+    """Строки расписания из БД без проверки TTL (если ИСУ недоступен для обновления)."""
+    with _conn() as con:
         rows = con.execute(
             """
             SELECT day, time, subject, room, teacher, lesson_type, parity

@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     # Паузы перед запросами к ИСУ (как в ITMOStalk): снижают нагрузку и таймауты
     isu_index_request_pause_sec: float = Field(0.5, alias="ISU_INDEX_REQUEST_PAUSE_SEC")
     isu_index_extra_pause_sec: float = Field(0.7, alias="ISU_INDEX_EXTRA_PAUSE_SEC")
+    # Полный цикл индексации (списки групп/потоков/студентов) — по умолчанию раз в ~3 месяца
+    isu_reindex_interval_sec: int = Field(90 * 24 * 3600, alias="ISU_REINDEX_INTERVAL_SEC")
+    # Кэш HTML/строк расписания потока: после TTL при открытии делается попытка обновить с ИСУ;
+    # при сбое сети показываются сохранённые строки (см. get_stale_schedule_entries).
+    isu_schedule_cache_max_age_sec: int = Field(
+        90 * 24 * 3600, alias="ISU_SCHEDULE_CACHE_MAX_AGE_SEC"
+    )
     isu_cache_db: str = Field(
         str(ROOT_DIR / "app" / "data" / "isu_cache.db"), alias="ISU_CACHE_DB"
     )

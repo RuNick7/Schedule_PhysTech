@@ -30,6 +30,7 @@ log = logging.getLogger("isu.indexer")
 _isu_session: Optional[IsuSession] = None
 _indexer_task: Optional[asyncio.Task] = None
 _isu_throttle_seq: int = 0
+_last_service_session_error: Optional[str] = None
 
 _LOGIN_ATTEMPTS = 5
 
@@ -37,6 +38,11 @@ _LOGIN_ATTEMPTS = 5
 def get_shared_isu_session() -> Optional[IsuSession]:
     """Returns the shared ISU session (may be None if not authenticated)."""
     return _isu_session
+
+
+def get_last_service_isu_error() -> Optional[str]:
+    """Текст последней ошибки входа/проверки сессии ИСУ (для сообщений пользователю)."""
+    return _last_service_session_error
 
 
 def _index_credentials() -> tuple[str, str]:
@@ -107,9 +113,10 @@ async def get_service_isu_session() -> Optional[IsuSession]:
     """
     Сессия ИСУ для загрузки расписаний: общая с индексатором или новая по ISU_INDEX_*.
     """
-    global _isu_session
+    global _isu_session, _last_service_session_error
     login, password = _index_credentials()
     if not login or not password:
+        _last_service_session_error = None
         return None
 
     if _isu_session is not None and _isu_session.session is not None:
@@ -119,6 +126,7 @@ async def get_service_isu_session() -> Optional[IsuSession]:
                 f"https://isu.ifmo.ru/pls/apex/f?p=2143:1:{_isu_session.nonce}",
             )
             if resp.status_code == 200 and "2143" in resp.text:
+                _last_service_session_error = None
                 return _isu_session
         except Exception:
             pass
@@ -126,11 +134,14 @@ async def get_service_isu_session() -> Optional[IsuSession]:
     try:
         isu = await _login_isu_with_retries()
         _isu_session = isu
+        _last_service_session_error = None
         return isu
     except IsuSessionError as e:
+        _last_service_session_error = str(e)
         log.warning("get_service_isu_session: %s", e)
         return None
     except Exception as e:
+        _last_service_session_error = str(e)
         log.warning("get_service_isu_session: auth failed: %s", e)
         return None
 
@@ -165,7 +176,7 @@ async def _ensure_session() -> None:
 
 async def _indexer_loop() -> None:
     delay = max(1.0, settings.isu_index_delay)
-    reindex_interval = 24 * 3600
+    reindex_interval = max(3600, int(settings.isu_reindex_interval_sec))
     startup_retry = 120
 
     while True:
