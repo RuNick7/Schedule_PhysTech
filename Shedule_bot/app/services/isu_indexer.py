@@ -115,7 +115,8 @@ async def _login_isu_with_retries() -> IsuSession:
 async def get_service_isu_session() -> Optional[IsuSession]:
     """
     Сессия ИСУ для загрузки расписаний: общая с индексатором или новая по ISU_INDEX_*.
-    Circuit breaker: если недавно был провал — не ретраим сразу для каждого потока.
+    Одна быстрая попытка без ретраев — при недоступном ИСУ падает за <2 сек,
+    ставит circuit breaker на cooldown, и все остальные потоки fast-fail.
     """
     global _isu_session, _last_service_session_error, _last_service_session_fail_ts
     login, password = _index_credentials()
@@ -123,7 +124,7 @@ async def get_service_isu_session() -> Optional[IsuSession]:
         _last_service_session_error = None
         return None
 
-    # Circuit breaker: если в течение cooldown после последнего провала — не ретраим
+    # Circuit breaker: не ретраим пока не истёк cooldown после последнего провала
     if _last_service_session_fail_ts:
         elapsed = _time.monotonic() - _last_service_session_fail_ts
         if elapsed < _SERVICE_SESSION_COOLDOWN_SEC:
@@ -142,8 +143,10 @@ async def get_service_isu_session() -> Optional[IsuSession]:
         except Exception:
             pass
 
+    # Одна попытка без ретраев (ретраи — только в индексаторе через _ensure_session)
     try:
-        isu = await _login_isu_with_retries()
+        isu = IsuSession(timeout=30)
+        await asyncio.to_thread(isu.authenticate_by_password, login, password)
         _isu_session = isu
         _last_service_session_error = None
         _last_service_session_fail_ts = 0.0
