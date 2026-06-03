@@ -15,6 +15,7 @@ from app.services.db import (
     get_autosend_message_id,
     set_autosend_cur_key,
     get_autosend_cur_key,
+    get_bot_mode,
 )
 from app.services.lessons_loader import load_lessons_for_user_group
 from app.utils.week_parity import week_parity_for_date
@@ -22,6 +23,7 @@ from app.utils.dt import now_tz
 from app.utils.format_schedule import format_day
 from app.config import settings
 from app.cron.gcal_autosync import gcal_autosync_tick
+from app.autosend.exam_runner import exam_alerts_tick
 
 
 log = logging.getLogger("autosend")
@@ -184,9 +186,14 @@ async def _tick(bot: Bot):
             ymd = now.strftime("%Y-%m-%d")
             log.debug("tick now=%s hhmm=%s", now.isoformat(), hhmm)
 
-            await _morning_send_mode1(bot, hhmm, ymd)
-            await _morning_send_mode2(bot, hhmm, ymd)
-            await _live_update_mode2(bot, ymd)
+            mode = get_bot_mode()
+            if mode == "normal":
+                await _morning_send_mode1(bot, hhmm, ymd)
+                await _morning_send_mode2(bot, hhmm, ymd)
+                await _live_update_mode2(bot, ymd)
+            elif mode == "exams":
+                await exam_alerts_tick(bot)
+            # holidays: ничего не отправляем
             await gcal_autosync_tick(bot)
 
             await asyncio.sleep(30)

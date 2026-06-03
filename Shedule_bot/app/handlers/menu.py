@@ -19,6 +19,7 @@ from app.services.db import (
     set_myitmo_tokens,
     set_user_sheet_source,
     clear_user_sheet_source,
+    set_exam_alerts_enabled,
 )
 from app.services.myitmo_client import exchange_password_for_tokens, MyItmoError
 from app.services.groups import list_groups_for_course
@@ -37,15 +38,18 @@ class SheetLinkSetup(StatesGroup):
 # --- keyboards ---
 
 def _kb_settings(user) -> InlineKeyboardBuilder:
+    exam_on = bool((user or {}).get("exam_alerts_enabled"))
+    exam_btn = f"🔔 Уведомления об экзаменах: {'✅' if exam_on else '⛔️'}"
     kb = InlineKeyboardBuilder()
-    kb.button(text="👥 Сменить группу", callback_data="settings:change_group")
-    kb.button(text="🎓 Сменить курс", callback_data="settings:change_course")
-    kb.button(text="🧭 Источник расписания", callback_data="settings:change_source")
-    kb.button(text="📄 Таблица Google Sheets", callback_data="settings:sheet:open")
-    kb.button(text="🔐 my.itmo аккаунт", callback_data="settings:myitmo:open")
-    kb.button(text="📨 Настроить автоотправку", callback_data="autosend:open")
-    kb.button(text="⬅️ Назад", callback_data="settings:back")
-    kb.adjust(1, 1, 1, 1, 1, 1, 1)
+    kb.button(text="👥 Сменить группу",         callback_data="settings:change_group")
+    kb.button(text="🎓 Сменить курс",            callback_data="settings:change_course")
+    kb.button(text="🧭 Источник расписания",     callback_data="settings:change_source")
+    kb.button(text="📄 Таблица Google Sheets",   callback_data="settings:sheet:open")
+    kb.button(text="🔐 my.itmo аккаунт",         callback_data="settings:myitmo:open")
+    kb.button(text="📨 Настроить автоотправку",  callback_data="autosend:open")
+    kb.button(text=exam_btn,                     callback_data="settings:exam_alerts:toggle")
+    kb.button(text="⬅️ Назад",                  callback_data="settings:back")
+    kb.adjust(1)
     return kb
 
 def _kb_courses():
@@ -151,6 +155,7 @@ def _settings_text(u) -> str:
     myitmo_login = _mask_login(u.get("myitmo_username"))
     myitmo_conn = "подключен" if u.get("myitmo_refresh_token") else "не подключен"
     auto = _autosend_summary(u)
+    exam_alerts = "✅ включены" if u.get("exam_alerts_enabled") else "⛔️ выключены"
     lines = [
         "⚙️ <b>Настройки</b>",
         f"👥 Группа: <b>{group}</b>",
@@ -159,6 +164,7 @@ def _settings_text(u) -> str:
         f"📄 Таблица: <b>{sheet_src}</b>",
         f"🔐 my.itmo: логин <b>{myitmo_login}</b>, токен <b>{myitmo_conn}</b>",
         f"📨 Автоотправка: {auto}",
+        f"🔔 Уведомления об экзаменах: {exam_alerts}",
         "",
         "Выберите, что изменить:",
     ]
@@ -390,3 +396,17 @@ async def settings_set_group(q: CallbackQuery):
         reply_markup=_kb_settings(u).as_markup()
     )
     await q.answer()
+
+
+@router.callback_query(F.data == "settings:exam_alerts:toggle")
+async def settings_exam_alerts_toggle(q: CallbackQuery):
+    u = get_user(q.from_user.id)
+    if not u:
+        await q.answer("Сначала /start", show_alert=True)
+        return
+    current = bool(u.get("exam_alerts_enabled"))
+    set_exam_alerts_enabled(q.from_user.id, not current)
+    u = get_user(q.from_user.id)
+    state_label = "включены ✅" if not current else "выключены ⛔️"
+    await q.answer(f"Уведомления об экзаменах {state_label}", show_alert=True)
+    await q.message.edit_text(_settings_text(u), reply_markup=_kb_settings(u).as_markup())

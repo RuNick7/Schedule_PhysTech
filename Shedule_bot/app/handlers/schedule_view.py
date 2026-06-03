@@ -6,7 +6,7 @@ from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
-from app.services.db import get_user, set_message_id
+from app.services.db import get_user, set_message_id, get_bot_mode, get_bot_setting
 from app.services.lessons_loader import load_lessons_for_user_group
 from app.utils.week_parity import week_parity_for_date
 from app.utils.dt import now_tz
@@ -14,6 +14,45 @@ from app.utils.format_schedule import format_day, format_week_compact_mono
 from app.config import settings
 
 router = Router()
+
+_HOLIDAYS_MSG = (
+    "🏖 <b>Каникулы!</b>\n\n"
+    "Бот временно не показывает расписание — наслаждайся отдыхом. 😎\n"
+    "Как только каникулы закончатся, всё вернётся в обычный режим."
+)
+
+
+def _exams_text_for_group(group: str) -> str:
+    spreadsheet_id = get_bot_setting("exam_spreadsheet_id")
+    sheet_gid_raw  = get_bot_setting("exam_sheet_gid")
+    if not spreadsheet_id or sheet_gid_raw is None:
+        return "📋 Режим экзаменов включён, но расписание экзаменов ещё не загружено."
+    try:
+        from app.services.exam_parser import get_exams_for_group
+        exams = get_exams_for_group(group, spreadsheet_id, int(sheet_gid_raw))
+    except Exception as e:
+        return f"⚠️ Не удалось загрузить расписание экзаменов: {e}"
+
+    if not exams:
+        return f"📋 <b>Экзамены — группа {group}</b>\n\nЭкзаменов для вашей группы не найдено."
+
+    from datetime import date as _date
+    today = _date.today()
+    exams.sort(key=lambda e: (e["date"] or _date.max, e["time"]))
+
+    lines = [f"📋 <b>Расписание экзаменов — группа {group}</b>\n{'—'*40}"]
+    for e in exams:
+        d = e["date"]
+        past = d is not None and d < today
+        mark = "✅ " if past else ("📌 " if d == today else "")
+        lines.append(
+            f"{mark}<b>{e['date_str']}</b> {e['time']}\n"
+            f"📚 {e['subject']}"
+            + (f"\n📍 {e['room']}" if e["room"] else "")
+        )
+        lines.append("—" * 40)
+    return "\n".join(lines).rstrip("—\n").strip()
+
 
 _NO_LESSONS_DEFAULT = [
     "Сегодня пар нет — самое время открыть YouTube через @kairavpn_bot 🎬",
@@ -114,7 +153,7 @@ def _filter_by_parity(lessons: List[dict], parity: str) -> List[dict]:
     np = _norm_parity(parity)
     return [it for it in lessons if _norm_parity(it.get("parity")) == np]
 
-async def _send_or_edit(q: CallbackQuery, text: str, kb):
+async def _send_or_edit(q: CallbackQuery, text: str, kb=None):
     user = get_user(q.from_user.id)
     # Режим 1 — редактируем одно сообщение
     if user and user.get("type") == 1 and user.get("message_id"):
@@ -154,6 +193,17 @@ async def schedule_entry(q: CallbackQuery):
     if not user or not user.get("group_code"):
         await q.answer("Сначала завершите онбординг: курс и группа.", show_alert=True)
         return
+    mode = get_bot_mode()
+    if mode == "holidays":
+        await _send_or_edit(q, _HOLIDAYS_MSG, None)
+        return
+    if mode == "exams":
+        source = str(user.get("schedule_source_mode") or "sheets").strip().lower()
+        if source == "sheets":
+            text = _exams_text_for_group(user["group_code"])
+            await _send_or_edit(q, text, None)
+            return
+        # myitmo_full / hybrid — показываем обычное расписание из my.itmo
     await _send_or_edit(q, "Выберите период:", kb_schedule_root())
 
 # ---------- корень выбора периода ----------

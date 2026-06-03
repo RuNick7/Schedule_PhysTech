@@ -112,6 +112,8 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_weekday INTEGER")
         if "gcal_autosync_last_key" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN gcal_autosync_last_key TEXT")
+        if "exam_alerts_enabled" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN exam_alerts_enabled INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
 def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
@@ -447,4 +449,94 @@ def list_user_ids_for_broadcast() -> List[int]:
             """
         )
         return [int(r["telegram_id"]) for r in cur.fetchall() if r["telegram_id"]]
+
+
+# ─── bot_settings ─────────────────────────────────────────────────────────────
+
+def init_bot_settings():
+    """Создаёт таблицы bot_settings и exam_alerts."""
+    with _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS exam_alerts (
+                telegram_id INTEGER,
+                alert_key   TEXT,
+                PRIMARY KEY (telegram_id, alert_key)
+            )
+        """)
+        conn.commit()
+
+
+def get_bot_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with _get_conn() as conn:
+        r = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r else default
+
+
+def set_bot_setting(key: str, value: Optional[str]) -> None:
+    with _get_conn() as conn:
+        if value is None:
+            conn.execute("DELETE FROM bot_settings WHERE key = ?", (key,))
+        else:
+            conn.execute(
+                "INSERT INTO bot_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        conn.commit()
+
+
+def get_bot_mode() -> str:
+    """Возвращает текущий режим бота: 'normal', 'exams', 'holidays'."""
+    return get_bot_setting("bot_mode", "normal") or "normal"
+
+
+def set_bot_mode(mode: str) -> None:
+    if mode not in ("normal", "exams", "holidays"):
+        raise ValueError("mode must be 'normal', 'exams' or 'holidays'")
+    set_bot_setting("bot_mode", mode)
+
+
+# ─── exam_alerts ──────────────────────────────────────────────────────────────
+
+def exam_alert_sent(telegram_id: int, alert_key: str) -> bool:
+    with _get_conn() as conn:
+        r = conn.execute(
+            "SELECT 1 FROM exam_alerts WHERE telegram_id = ? AND alert_key = ?",
+            (telegram_id, alert_key),
+        ).fetchone()
+        return r is not None
+
+
+def mark_exam_alert_sent(telegram_id: int, alert_key: str) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO exam_alerts(telegram_id, alert_key) VALUES (?, ?)",
+            (telegram_id, alert_key),
+        )
+        conn.commit()
+
+
+def set_exam_alerts_enabled(telegram_id: int, enabled: bool) -> None:
+    with _get_conn() as conn:
+        _ensure_user_exists(conn, telegram_id)
+        conn.execute(
+            "UPDATE users SET exam_alerts_enabled = ? WHERE telegram_id = ?",
+            (1 if enabled else 0, telegram_id),
+        )
+        conn.commit()
+
+
+def list_users_with_group() -> List[Dict[str, Any]]:
+    """Все пользователи у которых задана группа."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM users WHERE group_code IS NOT NULL AND group_code <> ''"
+        )
+        return [dict(r) for r in cur.fetchall()]
 
