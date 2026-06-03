@@ -25,10 +25,8 @@ from app.config import settings
 
 log = logging.getLogger("exam_parser")
 
-ROW_COURSE     = 0
-ROW_HEADER     = 1   # строка «тип»/пустая — пропускаем
-ROW_GROUP      = 2
-ROW_DATA_START = 3
+ROW_GROUP      = 1   # группы в строке 1 (0-based)
+ROW_DATA_START = 2   # данные начинаются со строки 2
 
 COL_DATE         = 0
 COL_TIME         = 2
@@ -80,18 +78,26 @@ def parse_exam_matrix(
 
     default_year = datetime.now().year
 
+    # Определяем шаг: если строки идут парами (предмет + аудитория) или по одной.
+    # Смотрим, есть ли в строке ROW_DATA_START дата+время — если да, шагаем по 1
+    # или по 2 в зависимости от того, есть ли у следующей строки дата.
     r = ROW_DATA_START
     while r < max_rows:
-        row_lec  = matrix[r]
-        row_room = matrix[r + 1] if r + 1 < max_rows else []
+        row_lec = matrix[r]
 
         date_raw = _clean(row_lec[COL_DATE] if COL_DATE < len(row_lec) else "")
         time_raw = _clean(row_lec[COL_TIME] if COL_TIME < len(row_lec) else "")
 
-        # пропускаем строки без времени или без даты
-        if not _is_time_range(time_raw) or not date_raw:
-            r += 2
+        if not date_raw or not _is_time_range(time_raw):
+            r += 1
             continue
+
+        # Смотрим следующую строку — аудитория или уже следующая дата?
+        next_row = matrix[r + 1] if r + 1 < max_rows else []
+        next_date = _clean(next_row[COL_DATE] if COL_DATE < len(next_row) else "")
+        next_time = _clean(next_row[COL_TIME] if COL_TIME < len(next_row) else "")
+        has_room_row = next_row and not next_date and not _is_time_range(next_time)
+        row_room = next_row if has_room_row else []
 
         exam_date = _parse_date(date_raw, default_year)
 
@@ -115,7 +121,7 @@ def parse_exam_matrix(
                 "room":     room,
             })
 
-        r += 2
+        r += 2 if has_room_row else 1
 
     return out
 
@@ -140,10 +146,8 @@ def load_exams(
         log.error("exam_parser: fetch failed: %s", e)
         return []
 
-    # expand merges так же, как для обычного расписания
-    matrix = values
-    from app.services.schedule_expand import _apply_merges_into
-    _apply_merges_into(matrix, merges)
+    from app.services.schedule_expand import expand_merged_matrix
+    matrix = expand_merged_matrix(values, merges=merges)
 
     return parse_exam_matrix(matrix)
 
