@@ -1,26 +1,28 @@
 """
 Парсер расписания экзаменов из Google Sheets.
 
-Структура листа аналогична обычному расписанию:
-  Строка 0: курс (1, 2, 3 …)
-  Строка 1: тип / пусто (игнорируем, чётности нет)
-  Строка 2: название группы
-  Строки 3+: пары по две строки подряд:
-    нечётная (0-based лекция): дата | № | время | предмет(ы)…
-    чётная   (0-based аудитория): пусто | пусто | пусто | аудитория(и)…
+Реальная структура листа (Расписание сессии весна 2026):
+  Строка 0: курс (1 курс, 2 курс …) — игнорируем
+  Строка 1: группы (3142, 3143, 3144-3145 …) — COL_FIRST_GROUP=2
+  Строка 2+: данные строки (по одной на каждую дату):
+    col 0 — день недели (вт, ср, …)
+    col 1 — дата (02.06, 03.06 …)
+    col 2+ — ячейка группы: «Предмет\nтип\nвремя, ауд. …» (всё в одной ячейке)
 
-  Дата в колонке 0 — формат «15.06», «15.06.26», «15.06.2026»,
-  либо русское слово (игнорируем).
+Ячейка может содержать:
+  «История\nэкзамен»                              → subject=История экзамен, time=None, room=''
+  «Физика\nконтрольная\n10:00, ауд. 2432»         → subject=Физика контрольная, time=10:00, room=ауд. 2432
+  «Мат. анализ\nэкзамен\n10:00-13:00\nауд. 1234» → subject=…, time=10:00-13:00, room=ауд. 1234
 """
 from __future__ import annotations
 
+import csv
+import io
 import re
 import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-import csv
-import io
 import requests
 
 from app.services.sheets_client import fetch_sheet_values_and_links
@@ -31,12 +33,13 @@ log = logging.getLogger("exam_parser")
 ROW_GROUP      = 1   # группы в строке 1 (0-based)
 ROW_DATA_START = 2   # данные начинаются со строки 2
 
-COL_DATE         = 0
-COL_TIME         = 2
-COL_FIRST_GROUP  = 3
+COL_DAY         = 0
+COL_DATE        = 1
+COL_FIRST_GROUP = 2
 
-_DATE_RE  = re.compile(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?")
-_TIME_RE  = re.compile(r"^\s*\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}\s*$")
+_DATE_RE     = re.compile(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?")
+_TIME_RE     = re.compile(r"\d{1,2}:\d{2}(?:\s*[-–—]\s*\d{1,2}:\d{2})?")
+_ROOM_RE     = re.compile(r"(?:ауд\.?\s*|корп\.?\s*|к\.?\s*)[\w,\s]+", re.I)
 
 
 def _clean(s: Optional[str]) -> str:
@@ -59,8 +62,44 @@ def _parse_date(raw: str, default_year: int = 0) -> Optional[date]:
         return None
 
 
-def _is_time_range(s: Optional[str]) -> bool:
-    return bool(_TIME_RE.match(_clean(s)))
+def _parse_cell(cell_text: str) -> Dict[str, str]:
+    """
+    Разбирает содержимое ячейки экзамена на поля subject / time / room.
+
+    Ячейка может использовать \n или пробел как разделитель строк
+    (CSV-экспорт превращает переносы в \n, сервисный аккаунт — тоже).
+    """
+    raw = _clean(cell_text)
+    if not raw:
+        return {"subject": "", "time": "", "room": ""}
+
+    lines = [l.strip() for l in re.split(r"\n|\r", raw) if l.strip()]
+
+    time_str = ""
+    room_str = ""
+    subject_lines = []
+
+    for line in lines:
+        # ищем время в строке: «10:00» или «10:00-12:00» или «10:00, ауд. 123»
+        tm = _TIME_RE.search(line)
+        if tm and not time_str:
+            time_str = tm.group(0).strip()
+            # остаток строки после времени — возможно аудитория
+            rest = line[tm.end():].strip().lstrip(",").strip()
+            if rest and not room_str:
+                room_str = rest
+            continue
+
+        # ищем аудиторию
+        rm = _ROOM_RE.search(line)
+        if rm and not room_str:
+            room_str = line.strip()
+            continue
+
+        subject_lines.append(line)
+
+    subject = " ".join(subject_lines).strip()
+    return {"subject": subject or raw, "time": time_str, "room": room_str}
 
 
 def parse_exam_matrix(
@@ -75,32 +114,13 @@ def parse_exam_matrix(
         return out
 
     row_group = matrix[ROW_GROUP] if len(matrix) > ROW_GROUP else []
-
-    max_rows = len(matrix)
-    max_cols = max((len(r) for r in matrix), default=0)
-
+    max_cols  = max((len(r) for r in matrix), default=0)
     default_year = datetime.now().year
 
-    # Определяем шаг: если строки идут парами (предмет + аудитория) или по одной.
-    # Смотрим, есть ли в строке ROW_DATA_START дата+время — если да, шагаем по 1
-    # или по 2 в зависимости от того, есть ли у следующей строки дата.
-    r = ROW_DATA_START
-    while r < max_rows:
-        row_lec = matrix[r]
-
-        date_raw = _clean(row_lec[COL_DATE] if COL_DATE < len(row_lec) else "")
-        time_raw = _clean(row_lec[COL_TIME] if COL_TIME < len(row_lec) else "")
-
-        if not date_raw or not _is_time_range(time_raw):
-            r += 1
+    for row in matrix[ROW_DATA_START:]:
+        date_raw = _clean(row[COL_DATE] if COL_DATE < len(row) else "")
+        if not date_raw or not _DATE_RE.search(date_raw):
             continue
-
-        # Смотрим следующую строку — аудитория или уже следующая дата?
-        next_row = matrix[r + 1] if r + 1 < max_rows else []
-        next_date = _clean(next_row[COL_DATE] if COL_DATE < len(next_row) else "")
-        next_time = _clean(next_row[COL_TIME] if COL_TIME < len(next_row) else "")
-        has_room_row = next_row and not next_date and not _is_time_range(next_time)
-        row_room = next_row if has_room_row else []
 
         exam_date = _parse_date(date_raw, default_year)
 
@@ -109,22 +129,22 @@ def parse_exam_matrix(
             if not group:
                 continue
 
-            subject = _clean(row_lec[c] if c < len(row_lec) else "")
-            room    = _clean(row_room[c] if c < len(row_room) else "")
+            cell = _clean(row[c] if c < len(row) else "")
+            if not cell:
+                continue
 
-            if not subject:
+            parsed = _parse_cell(cell)
+            if not parsed["subject"]:
                 continue
 
             out.append({
                 "group":    group,
                 "date":     exam_date,
                 "date_str": date_raw,
-                "time":     time_raw,
-                "subject":  subject,
-                "room":     room,
+                "time":     parsed["time"],
+                "subject":  parsed["subject"],
+                "room":     parsed["room"],
             })
-
-        r += 2 if has_room_row else 1
 
     return out
 
@@ -138,10 +158,7 @@ def _fetch_public_csv(spreadsheet_id: str, sheet_gid: int) -> List[List[Optional
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     reader = csv.reader(io.StringIO(resp.text))
-    matrix: List[List[Optional[str]]] = []
-    for row in reader:
-        matrix.append([cell if cell != "" else None for cell in row])
-    return matrix
+    return [[cell if cell != "" else None for cell in row] for row in reader]
 
 
 def load_exams(
@@ -150,15 +167,15 @@ def load_exams(
     creds_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Загружает и парсит расписание экзаменов из Google Sheets.
-    Сначала пробует через service account (поддерживает мержи),
-    при ошибке доступа — через публичный CSV-экспорт.
+    Загружает и парсит расписание экзаменов.
+    Сначала пробует service account (поддерживает мержи),
+    при ошибке доступа — публичный CSV-экспорт.
     """
     from app.services.schedule_expand import expand_merged_matrix
 
     creds = creds_path or settings.google_credentials
     try:
-        values, links, merges = fetch_sheet_values_and_links(
+        values, _links, merges = fetch_sheet_values_and_links(
             spreadsheet_id=spreadsheet_id,
             sheet_gid=sheet_gid,
             creds_path=creds,
