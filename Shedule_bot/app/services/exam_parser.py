@@ -19,8 +19,11 @@ import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
+import csv
+import io
+import requests
+
 from app.services.sheets_client import fetch_sheet_values_and_links
-from app.services.schedule_expand import expand_merged_matrix
 from app.config import settings
 
 log = logging.getLogger("exam_parser")
@@ -126,6 +129,21 @@ def parse_exam_matrix(
     return out
 
 
+def _fetch_public_csv(spreadsheet_id: str, sheet_gid: int) -> List[List[Optional[str]]]:
+    """Загружает публичный лист как CSV без авторизации."""
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        f"/export?format=csv&gid={sheet_gid}"
+    )
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    reader = csv.reader(io.StringIO(resp.text))
+    matrix: List[List[Optional[str]]] = []
+    for row in reader:
+        matrix.append([cell if cell != "" else None for cell in row])
+    return matrix
+
+
 def load_exams(
     spreadsheet_id: str,
     sheet_gid: int,
@@ -133,8 +151,11 @@ def load_exams(
 ) -> List[Dict[str, Any]]:
     """
     Загружает и парсит расписание экзаменов из Google Sheets.
-    Возвращает список {group, date, date_str, time, subject, room}.
+    Сначала пробует через service account (поддерживает мержи),
+    при ошибке доступа — через публичный CSV-экспорт.
     """
+    from app.services.schedule_expand import expand_merged_matrix
+
     creds = creds_path or settings.google_credentials
     try:
         values, links, merges = fetch_sheet_values_and_links(
@@ -142,12 +163,16 @@ def load_exams(
             sheet_gid=sheet_gid,
             creds_path=creds,
         )
+        matrix = expand_merged_matrix(values, merges=merges)
+        log.debug("exam_parser: loaded via service account, rows=%d", len(matrix))
     except Exception as e:
-        log.error("exam_parser: fetch failed: %s", e)
-        return []
-
-    from app.services.schedule_expand import expand_merged_matrix
-    matrix = expand_merged_matrix(values, merges=merges)
+        log.warning("exam_parser: service account failed (%s), trying public CSV", e)
+        try:
+            matrix = _fetch_public_csv(spreadsheet_id, sheet_gid)
+            log.debug("exam_parser: loaded via public CSV, rows=%d", len(matrix))
+        except Exception as e2:
+            log.error("exam_parser: public CSV also failed: %s", e2)
+            return []
 
     return parse_exam_matrix(matrix)
 
